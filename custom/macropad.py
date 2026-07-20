@@ -75,7 +75,10 @@ KEYCODES.update({
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
 })
 for n in range(1, 13):
-    KEYCODES["f%d" % n] = 0x3A + (n - 1)   # F1..F12 = 0x3A..0x45
+    KEYCODES["f%d" % n] = 0x3A + (n - 1)   # F1..F12  = 0x3A..0x45
+for n in range(13, 25):
+    KEYCODES["f%d" % n] = 0x68 + (n - 13)  # F13..F24 = 0x68..0x73 (macro-trigger keys:
+                                           # no physical key, no OS shortcut claims them)
 
 # --- Multimedia (Consumer Control) codes for this firmware (ReportID 3) --------------
 MEDIA_CODES = {

@@ -2,7 +2,7 @@
   "_comment": "Authoritative record of your macropad layout (6 keys + 1 knob). The device cannot report its own assignments, so THIS FILE is your source of truth. Edit it, then run:  python macropad.py apply layout.json  to write every entry to the device. Use --dry-run to preview first. Empty 'keys' entries are skipped (left untouched on the device).",
   "layer": 1,
   "keys": {
-    "1":  { "type": "key", "keys": "ctrl+c",          "note": "Copy" },
+    "1":  { "type": "key", "keys": "f13", "note": "Macro Studio: Calculator" },
     "2":  { "type": "key", "keys": "ctrl+v",          "note": "Paste" },
     "3":  { "type": "key", "keys": "win+.",           "note": "Windows Emoji picker (Win+.) - reprogram via Macro Studio 'Program Key on Device' to make it a macro key" },
     "4":  { "type": "key", "keys": "win+shift+s",     "note": "Screenshot / Snipping Tool (Win+Shift+S)" },
