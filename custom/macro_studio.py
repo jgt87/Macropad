@@ -808,17 +808,33 @@ def enable_dpi_awareness():
             pass
 
 
+def _dwm_set(hwnd, attr, value):
+    """DwmSetWindowAttribute(hwnd, attr, &int(value)). Silently ignores unsupported
+    attributes so the app still runs on older Windows builds."""
+    v = ctypes.c_int(value)
+    try:
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), ctypes.c_int(attr), ctypes.byref(v), ctypes.sizeof(v))
+    except Exception:
+        pass
+
+
 def _use_dark_titlebar(root, dark):
-    """Ask DWM for a dark title bar so the frame matches the content."""
+    """Match the window frame to the Win11 Fluent signature experiences: a themed title
+    bar (Color), rounded corners (Shapes and geometry), and - where the OS supports it - a
+    Mica backdrop (Materials). Each is best-effort; unsupported ones are no-ops."""
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20      # 19 on pre-20H1 builds
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWCP_ROUND = 2
+    # Note: no Mica backdrop. It would need the client area to be translucent, but Tk paints
+    # it opaque, so the material never shows - setting it would be dead code. Rounded corners
+    # and the themed frame both take effect.
     try:
         root.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        value = ctypes.c_int(1 if dark else 0)
-        # 20 on current Windows; 19 on early Win10 builds. Try both, ignore failure.
-        for attr in (20, 19):
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                ctypes.c_void_p(hwnd), ctypes.c_int(attr),
-                ctypes.byref(value), ctypes.sizeof(value))
+        for attr in (DWMWA_USE_IMMERSIVE_DARK_MODE, 19):
+            _dwm_set(hwnd, attr, 1 if dark else 0)
+        _dwm_set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
     except Exception:
         pass
 
@@ -831,6 +847,33 @@ def _pick_font(tkfont, candidates, size, weight="normal"):
     return ("Segoe UI", size, weight)
 
 
+def system_accent(dark):
+    """The user's chosen Windows accent as (fill, hover, text-on-accent), or None.
+
+    Fluent's 'Personal' principle: an app should wear the accent the user picked, not a
+    hardcoded blue. Windows stores 8 shades (three light, the base, three dark); it fills
+    with a darker shade on light backgrounds and a lighter shade on dark ones so the accent
+    stays legible either way. Returns None if the palette can't be read, so callers fall
+    back to their built-in default."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent") as k:
+            blob, _ = winreg.QueryValueEx(k, "AccentPalette")
+    except Exception:
+        return None
+    if not blob or len(blob) < 28:
+        return None
+
+    def shade(i):
+        return "#%02x%02x%02x" % (blob[i * 4], blob[i * 4 + 1], blob[i * 4 + 2])
+
+    # palette index 0..2 = light shades, 3 = base, 4..6 = dark shades
+    if dark:
+        return shade(1), shade(0), "#000000"   # light fill, lighter hover, dark text
+    return shade(4), shade(5), "#ffffff"        # dark fill, darker hover, white text
+
+
 def apply_theme(root):
     """Style ttk from scratch on the 'clam' base and return (palette, fonts).
 
@@ -841,7 +884,11 @@ def apply_theme(root):
     from tkinter import ttk
 
     dark = not _system_uses_light_theme()
-    p = PALETTES["dark" if dark else "light"]
+    p = dict(PALETTES["dark" if dark else "light"])   # copy: we override accent below
+    accent = system_accent(dark)
+    if accent:
+        p["accent"], p["accent_hover"], p["accent_text"] = accent
+        p["sel"], p["sel_text"] = accent[0], accent[2]   # selection wears the accent too
     body = _pick_font(tkfont, ("Segoe UI Variable Text", "Segoe UI"), 10)
     strong = _pick_font(tkfont, ("Segoe UI Variable Display", "Segoe UI"), 15, "bold")
     caption = _pick_font(tkfont, ("Segoe UI Variable Small", "Segoe UI"), 9)
