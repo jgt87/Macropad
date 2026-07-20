@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+
+# Macro Studio state: recorded macros + key bindings, machine-local
+custom/macros.json
+
+# Claude Code local overrides
+.claude/settings.local.json
+
+# --- Not redistributed -------------------------------------------------------
+# The vendor's MINI KeyBoard app and its decompilation stay local. This repo
+# publishes only the independent reimplementation in custom/ and the protocol
+# notes derived from it.
+*.exe
+*.dll
+*.pdb
+*.application
+*.exe.config
+*.exe.manifest
+app.publish/
+en-US/
+zh-CN/
+custom/decompiled/

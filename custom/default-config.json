@@ -1,0 +1,17 @@
+{
+  "_comment": "FACTORY DEFAULT bindings for this 6-key + 1-knob macropad (VID 1189 / PID 8890), as discovered by observation on 2026-07-17. This is a READ-ONLY restore point -- do NOT edit it. To restore the device to these defaults:  python macropad.py apply default-config.json  (use --dry-run to preview). For day-to-day changes, edit layout.json instead.",
+  "device": "MINI KeyBoard (VID 0x1189 / PID 0x8890) - 6 keys + 1 knob, 6 LEDs",
+  "layer": 1,
+  "keys": {
+    "1":  { "type": "key",   "keys": "ctrl+c",          "note": "Copy" },
+    "2":  { "type": "key",   "keys": "ctrl+v",          "note": "Paste" },
+    "3":  { "type": "key",   "keys": "win+.",           "note": "Windows Emoji picker (Win+.)" },
+    "4":  { "type": "key",   "keys": "win+shift+s",     "note": "Screenshot / Snipping Tool (Win+Shift+S)" },
+    "5":  { "type": "key",   "keys": "win+shift+right", "note": "Move active window to other monitor (Win+Shift+Right)" },
+    "6":  { "type": "key",   "keys": "win+tab",         "note": "Task View (Win+Tab)" },
+
+    "13": { "type": "media", "name": "voldown",         "note": "Knob turn left  = Volume Down" },
+    "14": { "type": "key",   "keys": "alt+tab",         "note": "Knob press      = Alt+Tab (switch window)" },
+    "15": { "type": "media", "name": "volup",           "note": "Knob turn right = Volume Up" }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "_comment": "Authoritative record of your macropad layout (6 keys + 1 knob). The device cannot report its own assignments, so THIS FILE is your source of truth. Edit it, then run:  python macropad.py apply layout.json  to write every entry to the device. Use --dry-run to preview first. Empty 'keys' entries are skipped (left untouched on the device).",
+  "layer": 1,
+  "keys": {
+    "1":  { "type": "key", "keys": "ctrl+c",          "note": "Copy" },
+    "2":  { "type": "key", "keys": "ctrl+v",          "note": "Paste" },
+    "3":  { "type": "key", "keys": "win+.",           "note": "Windows Emoji picker (Win+.) - reprogram via Macro Studio 'Program Key on Device' to make it a macro key" },
+    "4":  { "type": "key", "keys": "win+shift+s",     "note": "Screenshot / Snipping Tool (Win+Shift+S)" },
+    "5":  { "type": "key", "keys": "win+shift+right", "note": "Move active window to other monitor (Win+Shift+Right; with 2 screens Left toggles the same)" },
+    "6":  { "type": "key", "keys": "enter",           "note": "Claude: Submit / continue (Enter)" },
+
+    "13": { "type": "media", "name": "voldown",  "note": "knob turn left  = Volume Down" },
+    "14": { "type": "key",   "keys": "alt+tab",  "note": "knob press      = Alt+Tab (switch window)" },
+    "15": { "type": "media", "name": "volup",    "note": "knob turn right = Volume Up" }
+  }
+}
