@@ -2,12 +2,13 @@
 """
 Macro Studio - record / bind / run macros for the VID:1189 PID:8890 macropad.
 
-  * Record a keystroke macro (with timing).
+  * Record a keystroke macro (with timing). While recording, whichever application
+    you click into is detected and remembered as the macro's target.
   * Bind it to a macropad key. The app assigns that key a unique "exotic" chord
     (Ctrl+Alt+Win+F1..F9) and programs the physical key to send it, then listens
     for that chord and replays the macro.
-  * Optional application context per macro: launch/focus an app before the macro
-    runs, so the keystrokes land in the right program.
+  * Application context per macro: the target app is focused before the macro runs,
+    and started first if it isn't running, so the keystrokes land in the right program.
   * Lives in the system tray.
 
 Requires:  pip install hidapi keyboard pystray Pillow      (Python 3.x, Windows)
@@ -24,10 +25,17 @@ import sys
 import threading
 import time
 
+import keyboard
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 CONFIG_PATH = os.path.join(HERE, "macros.json")
-LAUNCH_DELAY = 0.6  # seconds to wait after launching/focusing an app before typing
+
+FOCUS_DELAY = 0.35      # settle time after focusing an app that was already running
+LAUNCH_DELAY = 1.2      # extra settle time after a cold start (first paint is not "ready")
+LAUNCH_TIMEOUT = 30.0   # how long to wait for a launched app's first window
+LAUNCH_POLL = 0.25      # how often to look for that window
+FOREGROUND_POLL = 0.2   # how often to sample the foreground window while recording
 
 # Each macropad key number -> the exotic chord it will send / we listen for.
 CHORDS = {
@@ -72,33 +80,73 @@ kernel32 = ctypes.windll.kernel32
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
 
+# HWNDs are pointers: without these, ctypes' default c_int return truncates them on 64-bit.
+user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.GetForegroundWindow.argtypes = []
 
-def _proc_name_for_hwnd(hwnd):
+# Shell surfaces that briefly take focus while you click around. Never a macro target.
+IGNORED_EXES = {
+    "explorer.exe", "searchhost.exe", "searchapp.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "textinputhost.exe", "lockapp.exe",
+}
+
+
+def _pid_for_hwnd(hwnd):
     pid = ctypes.c_ulong()
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    return pid.value
+
+
+def _exe_path_for_pid(pid):
+    """Full path of a process's executable, or '' if it's gone / not ours to query."""
+    if not pid:
+        return ""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not h:
         return ""
     try:
-        buf = ctypes.create_unicode_buffer(512)
-        size = ctypes.c_ulong(512)
+        buf = ctypes.create_unicode_buffer(32768)
+        size = ctypes.c_ulong(32768)
         if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return os.path.basename(buf.value).lower()
+            return buf.value
         return ""
     finally:
         kernel32.CloseHandle(h)
 
 
-def _find_window_by_exe(exe_basename):
-    exe_basename = exe_basename.lower()
-    if not exe_basename.endswith(".exe"):
-        exe_basename += ".exe"
+def _exe_name_for_pid(pid):
+    return os.path.basename(_exe_path_for_pid(pid)).lower()
+
+
+def _normalise_exe(name):
+    name = os.path.basename(name).lower()
+    return name if name.endswith(".exe") else name + ".exe"
+
+
+def foreground_app():
+    """(pid, full exe path) of the foreground window. (0, '') for our own windows,
+    shell surfaces, and anything we can't identify."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return 0, ""
+    pid = _pid_for_hwnd(hwnd)
+    if not pid or pid == os.getpid():
+        return 0, ""
+    path = _exe_path_for_pid(pid)
+    if not path or os.path.basename(path).lower() in IGNORED_EXES:
+        return 0, ""
+    return pid, path
+
+
+def _find_window(match):
+    """First visible, titled window whose (pid, exe basename) satisfies `match`."""
     found = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
     def cb(hwnd, _):
         if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0:
-            if _proc_name_for_hwnd(hwnd) == exe_basename:
+            pid = _pid_for_hwnd(hwnd)
+            if match(pid, _exe_name_for_pid(pid)):
                 found.append(hwnd)
                 return False
         return True
@@ -107,37 +155,132 @@ def _find_window_by_exe(exe_basename):
     return found[0] if found else None
 
 
-def focus_or_launch(command):
-    """Focus an already-running instance of the app, else launch it. `command` is an
-    exe name / full path / URL, optionally with arguments."""
+def _find_window_by_exe(exe):
+    exe = _normalise_exe(exe)
+    return _find_window(lambda pid, name: name == exe)
+
+
+def _find_window_by_pid(pid):
+    return _find_window(lambda p, name: p == pid) if pid else None
+
+
+def _split_command(command):
+    """'"C:/Program Files/App/app.exe" --flag' -> ('C:/Program Files/App/app.exe', '--flag').
+
+    Handles quoted targets and unquoted paths containing spaces before falling back to
+    splitting on whitespace, so auto-detected full paths survive a round trip."""
+    command = (command or "").strip()
     if not command:
-        return
-    first = command.split()[0].strip('"')
-    exe = os.path.basename(first)
-    hwnd = _find_window_by_exe(exe)
-    if hwnd:
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        # focus-steal workaround: tap ALT then set foreground
-        try:
-            import keyboard as _kb
-            _kb.press_and_release("alt")
-        except Exception:
-            pass
-        user32.SetForegroundWindow(hwnd)
-        return
+        return "", ""
+    if command.startswith('"'):
+        end = command.find('"', 1)
+        if end > 0:
+            return command[1:end], command[end + 1:].strip()
+    if os.path.exists(command):
+        return command, ""
+    parts = command.split(None, 1)
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+def _focus(hwnd):
+    user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+    # focus-steal workaround: tap ALT then set foreground
     try:
-        os.startfile(first) if os.path.exists(first) else subprocess.Popen(command, shell=True)
+        keyboard.press_and_release("alt")
+    except Exception:
+        pass
+    user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+
+
+def _launch(command):
+    target, args = _split_command(command)
+    try:
+        if os.path.exists(target) and not args:
+            os.startfile(target)
+        else:
+            subprocess.Popen(command, shell=True)
+        return True
     except Exception:
         try:
             subprocess.Popen(command, shell=True)
+            return True
         except Exception:
-            pass
+            return False
+
+
+def ensure_app(command, pid=0):
+    """Put the macro's application in the foreground, starting it if it isn't running.
+
+    Tries, in order: the exact instance recorded with the macro (`pid`), any window of
+    the same executable, then a cold start — waiting up to LAUNCH_TIMEOUT for its first
+    window rather than guessing at a fixed delay. Returns True once it has focus."""
+    if not command:
+        return True
+    target, _ = _split_command(command)
+    exe = _normalise_exe(target)
+
+    hwnd = None
+    if pid and _exe_name_for_pid(pid) == exe:   # guards against a recycled pid
+        hwnd = _find_window_by_pid(pid)
+    if hwnd is None:
+        hwnd = _find_window_by_exe(exe)
+    if hwnd:
+        _focus(hwnd)
+        time.sleep(FOCUS_DELAY)
+        return True
+
+    if not _launch(command):
+        return False
+    deadline = time.time() + LAUNCH_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(LAUNCH_POLL)
+        hwnd = _find_window_by_exe(exe)
+        if hwnd:
+            _focus(hwnd)
+            time.sleep(LAUNCH_DELAY)
+            return True
+    return False
+
+
+class ForegroundWatcher(threading.Thread):
+    """Samples the foreground window while a macro is being recorded, so the macro can
+    remember which application the user clicked into. Our own windows are ignored, so
+    the Recording overlay never registers as the target."""
+
+    def __init__(self, interval=FOREGROUND_POLL):
+        threading.Thread.__init__(self, daemon=True)
+        self.interval = interval
+        self.transitions = []          # (timestamp, exe path, pid), in the order seen
+        self._stop = threading.Event()
+
+    def run(self):
+        last = None
+        while not self._stop.is_set():
+            pid, path = foreground_app()
+            if path and path != last:
+                self.transitions.append((time.time(), path, pid))
+                last = path
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+
+    def app_at(self, when=None):
+        """(exe path, pid) of the app that had focus at `when` — normally the time of
+        the first recorded keystroke, so switching away afterwards doesn't steal the
+        binding. Falls back to the first app seen."""
+        if not self.transitions:
+            return "", 0
+        chosen = self.transitions[0]
+        if when:
+            for entry in self.transitions:
+                if entry[0] > when:
+                    break
+                chosen = entry
+        return chosen[1], chosen[2]
 
 
 # ---------------------------------------------------------------- macro engine
-import keyboard  # noqa: E402
-
-
 def serialize_events(events):
     out = []
     for e in events:
@@ -162,6 +305,14 @@ class Engine:
     def __init__(self, cfg):
         self.cfg = cfg
         self._registered = {}   # keynum -> hotkey handle
+        self.status_cb = None   # set by the GUI; called from playback threads
+
+    def _status(self, msg):
+        if self.status_cb:
+            try:
+                self.status_cb(msg)
+            except Exception:
+                pass
 
     def register_all(self):
         self.unregister_all()
@@ -191,9 +342,10 @@ class Engine:
 
     def _play(self, macro):
         app = macro.get("app", "")
-        if app:
-            focus_or_launch(app)
-            time.sleep(LAUNCH_DELAY)
+        if app and not ensure_app(app, macro.get("app_pid", 0)):
+            # Don't type into whatever happens to be focused instead.
+            self._status("Could not start %s - macro not run" % os.path.basename(app))
+            return
         # release the trigger modifiers so they don't contaminate the macro
         for mod in ("ctrl", "alt", "shift", "windows"):
             try:
@@ -229,9 +381,12 @@ def run_gui(cfg, engine):
 
     root = tk.Tk()
     root.title("Macro Studio - macropad")
-    root.geometry("640x420")
+    root.geometry("880x460")
 
-    recording = {"events": None, "hook": None}
+    recording = {"events": None, "hook": None, "watcher": None}
+
+    # button bar: packed first so it sits above the panes, buttons filling from the left
+    bar = tk.Frame(root); bar.pack(side="top", fill="x", padx=8, pady=(8, 0))
 
     # layout
     left = tk.Frame(root); left.pack(side="left", fill="both", expand=True, padx=8, pady=8)
@@ -249,11 +404,15 @@ def run_gui(cfg, engine):
     def set_status(msg):
         status.config(text=msg)
 
+    # playback runs on worker threads; marshal their status back onto the tk thread
+    engine.status_cb = lambda msg: root.after(0, lambda: set_status(msg))
+
     def refresh():
         macro_list.delete(0, "end")
         for name in sorted(cfg["macros"]):
             app = cfg["macros"][name].get("app", "")
-            macro_list.insert("end", name + (f"   [app: {os.path.basename(app.split()[0])}]" if app else ""))
+            label = os.path.basename(_split_command(app)[0]) if app else ""
+            macro_list.insert("end", name + (f"   [app: {label}]" if label else ""))
         key_list.delete(0, "end")
         for keynum in ("1", "2", "3", "4", "5", "6", "13", "14", "15"):
             bound = cfg["bindings"].get(keynum, "-")
@@ -279,22 +438,36 @@ def run_gui(cfg, engine):
         overlay = tk.Toplevel(root)
         overlay.title("Recording")
         overlay.attributes("-topmost", True)
-        overlay.geometry("300x120")
-        tk.Label(overlay, text="Recording keystrokes...\nType your macro, then click Stop.",
+        overlay.geometry("340x140")
+        tk.Label(overlay, text="Recording keystrokes...\n\nClick into the application you want this\n"
+                               "macro to run in, type it, then click Stop.",
                  font=("Segoe UI", 10)).pack(pady=10)
         recording["events"] = []
         recording["hook"] = keyboard.hook(lambda e: recording["events"].append(e))
+        recording["watcher"] = ForegroundWatcher()
+        recording["watcher"].start()
 
         def stop():
             if recording["hook"]:
                 keyboard.unhook(recording["hook"])
                 recording["hook"] = None
-            events = serialize_events(recording["events"] or [])
+            watcher, recording["watcher"] = recording["watcher"], None
+            raw = recording["events"] or []
+            if watcher:
+                watcher.stop()
+            # bind to whatever had focus when the first key landed
+            app, app_pid = watcher.app_at(raw[0].time if raw else None) if watcher else ("", 0)
+            events = serialize_events(raw)
             overlay.destroy()
-            cfg["macros"][name] = {"events": events, "app": ""}
+            cfg["macros"][name] = {"events": events, "app": app, "app_pid": app_pid}
             save_config(cfg)
             refresh()
-            set_status(f"Saved macro '{name}' ({len(events)} events)")
+            if app:
+                set_status(f"Saved '{name}' ({len(events)} events) -> {os.path.basename(app)}"
+                           f" (pid {app_pid})")
+            else:
+                set_status(f"Saved '{name}' ({len(events)} events) - no app detected,"
+                           f" use Set App... to pick one")
 
         tk.Button(overlay, text="Stop", width=12, command=stop).pack(pady=6)
         overlay.protocol("WM_DELETE_WINDOW", stop)
@@ -324,6 +497,7 @@ def run_gui(cfg, engine):
         if app is None:
             return
         cfg["macros"][name]["app"] = app.strip()
+        cfg["macros"][name]["app_pid"] = 0   # a hand-picked app has no recorded instance
         save_config(cfg); refresh()
         set_status(f"Set app context for '{name}'")
 
@@ -331,8 +505,11 @@ def run_gui(cfg, engine):
         name = selected_macro()
         if not name:
             set_status("Select a macro first"); return
-        set_status(f"Running '{name}' in 2s - focus the target window...")
-        root.after(2000, lambda: engine._play(cfg["macros"][name]))
+        app = cfg["macros"][name].get("app", "")
+        where = os.path.basename(_split_command(app)[0]) if app else "the focused window"
+        set_status(f"Running '{name}' in 2s -> {where}")
+        # via _run: playback threads off the GUI, which may block while an app starts
+        root.after(2000, lambda: engine._run(name))
 
     def bind():
         name = selected_macro(); keynum = selected_keynum()
@@ -361,13 +538,12 @@ def run_gui(cfg, engine):
             messagebox.showerror("Device error",
                                  f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
 
-    # buttons
-    bar = tk.Frame(root); bar.pack(side="bottom", fill="x", pady=4)
+    # buttons (into the bar created above the panes)
     for txt, fn in [("Record New", record_new), ("Delete", delete_macro),
                     ("Set App...", set_app), ("Test", test_macro),
                     ("Bind ->Key", bind), ("Unbind", unbind),
                     ("Program Key on Device", program_key)]:
-        tk.Button(bar, text=txt, command=fn).pack(side="left", padx=3)
+        tk.Button(bar, text=txt, command=fn).pack(side="left", padx=(0, 6))
 
     refresh()
 

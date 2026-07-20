@@ -45,10 +45,18 @@ config" command, so the JSON files *are* the record of what's on the device.
 **`macro_studio.py`** — the main user-facing app, and the workaround for the firmware's
 **5-keystroke-per-macro limit**. Each macropad key is programmed to emit a unique chord
 (keys 1–6 → `Ctrl+Alt+Win+F1–F6`, knob 13/14/15 → `F7–F9`); the tray app listens for those
-chords with the `keyboard` library and replays a recorded macro of arbitrary length, optionally
-launching/focusing an app first (win32 `EnumWindows` + `SetForegroundWindow`). It imports
+chords with the `keyboard` library and replays a recorded macro of arbitrary length. It imports
 `macropad` to program the device — it never speaks HID itself. State lives in `macros.json`
 (gitignored/untracked; created on first run).
+
+Its win32 layer (`ctypes` over `user32`/`kernel32`) does the app-context work:
+`ForegroundWatcher` samples the foreground window while recording and `app_at()` picks the app
+that had focus at the first keystroke; `ensure_app()` then focuses that app at playback —
+preferring the exact recorded pid, falling back to any window of the same exe, and finally cold
+-starting it and **polling for its window** rather than trusting a fixed delay. When resolving
+an app fails, playback is abandoned: typing a macro into an arbitrary focused window is worse
+than doing nothing. Set explicit `restype`/`argtypes` on any new user32 call returning or
+taking an `HWND` — ctypes' default `c_int` truncates handles on 64-bit.
 
 **`agent_led.py`** — tiny Claude Code hook helper: `on` starts the LED colour-cycle, `off` turns
 it off, wired to `UserPromptSubmit`/`Stop` in user settings. It swallows **all** exceptions by

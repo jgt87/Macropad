@@ -111,9 +111,15 @@ How it works: each key sends a unique chord it listens for — **Keys 1–6 → 
 
 - **Install deps** (one-time): `pip install hidapi keyboard pystray Pillow`
 - **Run:** `pythonw macro_studio.py` (auto-starts via a Startup-folder shortcut).
-- **Workflow:** Record New → (optional) Set App… → select macro + key → Bind →Key →
-  Program Key on Device. Then press that macropad key to run the macro. Use **Test** to
-  try without the pad. Closing the window hides it to the tray.
+- **Workflow:** Record New → select macro + key → Bind →Key → Program Key on Device. Then
+  press that macropad key to run the macro. Use **Test** to try without the pad. Closing the
+  window hides it to the tray.
+- **App context is automatic.** While recording, click into the application you want the
+  macro to run in — Macro Studio notes which process had focus when your first keystroke
+  landed and binds the macro to that executable. At playback it focuses that app first, and
+  **starts it if it isn't running**, waiting for its window to appear (up to 30s) before
+  typing. If the app can't be started the macro is skipped rather than typed into whatever
+  happened to be focused. **Set App…** overrides the detection by hand.
 - **Config:** `macros.json`. **Smoke-test:** `python macro_studio.py --selftest`.
 - Notes: keystroke macros only (no mouse); global hooks may need the app run as admin to
   catch every key.
