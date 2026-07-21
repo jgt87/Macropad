@@ -1075,6 +1075,17 @@ def _use_dark_titlebar(root, dark):
         pass
 
 
+def _round_borderless(win):
+    """Round a borderless Toplevel's corners the Win11 way (DWM corner preference), for the
+    custom context menu. Best-effort: a no-op on older Windows / other platforms."""
+    try:
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        _dwm_set(hwnd, 33, 2)                                       # CORNER_PREFERENCE = ROUND
+    except Exception:
+        pass
+
+
 def _pick_font(tkfont, candidates, size, weight="normal"):
     families = set(tkfont.families())
     for name in candidates:
@@ -1256,6 +1267,12 @@ def apply_theme(root):
     style.map("Treeview.Heading", background=[("active", p["btn_hover"])])
     style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])   # no inner border
 
+    # Dark text field for the themed input dialogs. clam's Entry is otherwise light grey.
+    style.configure("TEntry", fieldbackground=p["surface"], foreground=p["text"],
+                    insertcolor=p["text"], bordercolor=p["border"], lightcolor=p["border"],
+                    darkcolor=p["border"], borderwidth=1, padding=6)
+    style.map("TEntry", bordercolor=[("focus", p["accent"])])
+
     _use_dark_titlebar(root, dark)
     return p, {"body": body, "strong": strong, "caption": caption}
 
@@ -1297,7 +1314,7 @@ def make_table(parent, columns, widths):
 # ---------------------------------------------------------------- GUI
 def run_gui(cfg, engine):
     import tkinter as tk
-    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
     root.title("Macro Studio")
@@ -1345,15 +1362,56 @@ def run_gui(cfg, engine):
     key_card, key_list = make_table(panes, ("Key", "Sends", "Runs macro"), (120, 100, 140))
     key_card.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
 
-    # per-pane action bars: a button sitting under a pane plainly acts on that pane, which
-    # the old single toolbar left ambiguous. Filled once the handlers below exist.
-    macro_bar = ttk.Frame(panes)
-    macro_bar.grid(row=2, column=0, sticky="w", pady=(10, 0))
+    # Key-pane actions are buttons; macro actions live on a right-click context menu (built
+    # once the handlers below exist), so the macro pane just carries a discovery hint here.
+    ttk.Label(panes, text="Right-click a macro to rename, set its app, test, or delete.",
+              style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(10, 0))
     key_bar = ttk.Frame(panes)
     key_bar.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(10, 0))
 
     def set_status(msg):
         status.config(text=msg)
+
+    def ask_string(title, prompt, initial=""):
+        """Themed replacement for simpledialog.askstring: dark, rounded, ttk widgets, with an
+        accent OK. Returns the entered string, or None if cancelled."""
+        win = tk.Toplevel(root)
+        win.title(title)
+        win.transient(root)
+        win.resizable(False, False)
+        win.configure(bg=p["bg"])
+        _use_dark_titlebar(win, not _system_uses_light_theme())
+        frame = ttk.Frame(win, padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=prompt, style="Muted.TLabel", justify="left").pack(anchor="w")
+        var = tk.StringVar(value=initial)
+        entry = ttk.Entry(frame, textvariable=var, width=40, font=fonts["body"])
+        entry.pack(fill="x", pady=(10, 0))
+        entry.focus_set()
+        entry.selection_range(0, "end")
+
+        out = {"v": None}
+
+        def ok(_=None):
+            out["v"] = var.get()
+            win.destroy()
+
+        row = ttk.Frame(frame)
+        row.pack(anchor="e", pady=(18, 0))
+        ttk.Button(row, text="OK", style="Accent.TButton", command=ok).pack(side="left",
+                                                                            padx=(0, 8))
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="left")
+        entry.bind("<Return>", ok)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        px = root.winfo_rootx() + (root.winfo_width() - w) // 2
+        py = root.winfo_rooty() + max(40, (root.winfo_height() - h) // 3)
+        win.geometry("%dx%d+%d+%d" % (w, h, px, py))
+        win.grab_set()
+        win.wait_window()
+        return out["v"]
 
     # playback runs on worker threads; marshal their status back onto the tk thread
     engine.status_cb = lambda msg: root.after(0, lambda: set_status(msg))
@@ -1411,15 +1469,13 @@ def run_gui(cfg, engine):
             if b is not None:
                 b.state(["!disabled"] if on else ["disabled"])
 
-        for name in ("rename", "set_app", "test", "delete"):
-            enable(name, has_macro)
         enable("bind", has_macro and keynum is not None)
         enable("unbind", key_used)
         enable("assign_shortcut", keynum is not None)
 
     # --- recording ---
     def record_new():
-        name = simpledialog.askstring("Record macro", "Name for this macro:", parent=root)
+        name = ask_string("Record macro", "Name for this macro:")
         if not name:
             return
         overlay = tk.Toplevel(root)
@@ -1523,25 +1579,33 @@ def run_gui(cfg, engine):
 
         hook = keyboard.hook(on_key)
 
-        # F13..F24 have no physical key, so they can't be pressed - offer them as a picker.
-        # They're the ideal macro trigger: the app can detect them and nothing else sends them.
+        # F13..F24 have no physical key, so they can't be pressed - offer them in a menu that
+        # matches the app's other right-click menu. They're the ideal macro trigger: the app
+        # can detect them and nothing else ever sends them.
         trig_row = ttk.Frame(body)
         trig_row.pack(anchor="w", pady=(10, 0))
         ttk.Label(trig_row, text="…or a trigger key (for macros):",
                   style="Muted.TLabel").pack(side="left")
-        trig = ttk.Combobox(trig_row, width=6, state="readonly",
-                            values=["F%d" % n for n in range(13, 25)])
-        trig.pack(side="left", padx=(8, 0))
+        trig_btn = ttk.Button(trig_row, text="Choose  ▾")
+        trig_btn.pack(side="left", padx=(8, 0))
 
-        def pick_trigger(_=None):
+        def choose_trigger():
             import macropad as m
-            fn = trig.get().lower()
-            state["events"] = []                       # a picked trigger replaces any presses
-            state["strokes"] = [(0, m.KEYCODES[fn])]
-            preview.config(text=fn)
-            save_btn.state(["!disabled"])
 
-        trig.bind("<<ComboboxSelected>>", pick_trigger)
+            def make(fn):
+                def pick():
+                    state["events"] = []               # a picked trigger replaces any presses
+                    state["strokes"] = [(0, m.KEYCODES[fn])]
+                    preview.config(text=fn)
+                    save_btn.state(["!disabled"])
+                    trig_btn.config(text=fn.upper() + "  ▾")
+                return pick
+
+            items = [("F%d" % n, make("f%d" % n)) for n in range(13, 25)]
+            show_popup_menu(items, trig_btn.winfo_rootx(),
+                            trig_btn.winfo_rooty() + trig_btn.winfo_height())
+
+        trig_btn.config(command=choose_trigger)
 
         def finish(save):
             keyboard.unhook(hook)
@@ -1603,8 +1667,7 @@ def run_gui(cfg, engine):
         old = selected_macro()
         if not old:
             set_status("Select a macro first"); return
-        new = simpledialog.askstring("Rename macro", "New name:",
-                                     initialvalue=old, parent=root)
+        new = ask_string("Rename macro", "New name:", initial=old)
         if new is None:
             return
         new = new.strip()
@@ -1652,11 +1715,11 @@ def run_gui(cfg, engine):
         if not name:
             set_status("Select a macro first"); return
         cur = cfg["macros"][name].get("app", "")
-        app = simpledialog.askstring(
+        app = ask_string(
             "Application context",
             "App to launch/focus before running (exe name, full path, or URL).\n"
             "Leave blank for none.\nExamples:  code   |   chrome   |   notepad.exe",
-            initialvalue=cur, parent=root)
+            initial=cur)
         if app is None:
             return
         cfg["macros"][name]["app"] = app.strip()
@@ -1789,13 +1852,92 @@ def run_gui(cfg, engine):
     btns["export"].pack(side="right", anchor="n", padx=(0, 8))
 
     # macro-pane actions, then key-pane actions - each under the list it operates on
-    add_button(macro_bar, "rename", "Rename", rename_macro)
-    add_button(macro_bar, "set_app", "Set app…", set_app)
-    add_button(macro_bar, "test", "Test", test_macro)
-    add_button(macro_bar, "delete", "Delete", delete_macro)
     add_button(key_bar, "bind", "Map Macro", bind)
     add_button(key_bar, "assign_shortcut", "Bind to key", assign_shortcut)
     add_button(key_bar, "unbind", "Unbind", unbind)
+
+    # macro actions live on a right-click menu instead of a button bar. tk.Menu is the dated
+    # Win95-style control, so this is a hand-built popup: a rounded, padded, dark Toplevel with
+    # Fluent hover highlights, matching the rest of the window.
+    def show_popup_menu(items, x, y):
+        """items = [(label, command) | None(separator)]; posts a Win11-style menu at x,y."""
+        s = max(1.0, root.winfo_fpixels("1i") / 96.0)   # DPI scale for paddings
+        prev_grab = root.grab_current()   # e.g. a modal dialog we're opening on top of
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=p["border"])                    # 1px hairline border around the card
+        card = tk.Frame(win, bg=p["surface"])
+        card.pack(padx=1, pady=1)
+        body = tk.Frame(card, bg=p["surface"])
+        body.pack(padx=int(4 * s), pady=int(4 * s))
+
+        closed = {"v": False}
+
+        def close(_=None):
+            if closed["v"]:
+                return
+            closed["v"] = True
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+            if prev_grab is not None:     # hand modality back to the dialog underneath
+                try:
+                    prev_grab.grab_set()
+                except Exception:
+                    pass
+
+        def run(cmd):
+            close()
+            root.after(1, cmd)          # let the menu tear down before the action's own dialog
+
+        for it in items:
+            if it is None:
+                tk.Frame(body, bg=p["border"], height=1).pack(
+                    fill="x", padx=int(8 * s), pady=int(4 * s))
+                continue
+            label, cmd = it
+            row = tk.Label(body, text=label, bg=p["surface"], fg=p["text"], anchor="w",
+                           font=fonts["body"], padx=int(14 * s), pady=int(7 * s))
+            row.pack(fill="x")
+            row.bind("<Enter>", lambda e, w=row: w.configure(bg=p["btn_hover"]))
+            row.bind("<Leave>", lambda e, w=row: w.configure(bg=p["surface"]))
+            row.bind("<Button-1>", lambda e, c=cmd: run(c))
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry("%dx%d+%d+%d" % (w, h, max(0, min(x, sw - w - 4)),
+                                      max(0, min(y, sh - h - 4))))
+        _round_borderless(win)
+
+        def on_outside(e):
+            # the local grab funnels every click to this window, so dismiss when a press lands
+            # outside its on-screen bounds (screen coords, robust to which child got the event)
+            wx, wy, ww, wh = (win.winfo_rootx(), win.winfo_rooty(),
+                              win.winfo_width(), win.winfo_height())
+            if not (wx <= e.x_root < wx + ww and wy <= e.y_root < wy + wh):
+                close()
+
+        win.bind("<Button-1>", on_outside)
+        win.bind("<Button-3>", on_outside)
+        win.bind("<Escape>", close)
+        win.bind("<FocusOut>", close)   # alt-tab / other-app click -> dismiss
+        win.focus_force()
+        win.grab_set()
+
+    def macro_context(event):
+        row = macro_list.identify_row(event.y)   # select the row under the cursor first, so
+        if not row:                              # the action targets what was right-clicked
+            return
+        macro_list.selection_set(row)
+        update_states()
+        show_popup_menu([("Rename", rename_macro), ("Set app…", set_app), ("Test", test_macro),
+                         None, ("Delete", delete_macro)], event.x_root, event.y_root)
+
+    macro_list.bind("<Button-3>", macro_context)
 
     # keep buttons in step with the selection, and offer the native direct interactions
     macro_list.bind("<<TreeviewSelect>>", update_states)
