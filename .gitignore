@@ -21,3 +21,7 @@ app.publish/
 en-US/
 zh-CN/
 custom/decompiled/
+
+# PyInstaller build output
+custom/build/
+custom/dist/

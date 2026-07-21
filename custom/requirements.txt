@@ -1,0 +1,5 @@
+hidapi
+keyboard
+mouse
+pystray
+Pillow

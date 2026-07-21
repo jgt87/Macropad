@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: custom
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Stamp version from tag
+        working-directory: custom
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          Set-Content -Path _version.py -Encoding utf8 -Value "# Written by the release workflow.`n__version__ = `"$ver`""
+
+      - name: Build executable
+        working-directory: custom
+        run: python -m PyInstaller --clean --noconfirm macro_studio.spec
+
+      - name: Rename artifact
+        working-directory: custom
+        shell: pwsh
+        run: Copy-Item dist/MacroStudio.exe "dist/MacroStudio-${{ github.ref_name }}.exe"
+
+      - name: Publish release with executable
+        uses: softprops/action-gh-release@v2
+        with:
+          files: custom/dist/MacroStudio-${{ github.ref_name }}.exe
+          generate_release_notes: true
