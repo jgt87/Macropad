@@ -16,7 +16,7 @@ truth whenever protocol behaviour is in question, so don't assume a fresh clone 
 
 ## Commands
 
-All commands run from `custom/`. There is no build step and no test suite.
+All commands run from `custom/`. There is no automated test suite.
 
 ```bash
 pip install hidapi                              # macropad.py
@@ -30,7 +30,10 @@ python macropad.py --dry-run <any subcommand>   # print HID frames, send nothing
 
 pythonw macro_studio.py                         # tray GUI (auto-starts via Startup shortcut)
 python macro_studio.py --selftest               # smoke test: config, bindings, hotkeys
+powershell -ExecutionPolicy Bypass -File build.ps1  # build dist/MacroStudio.exe
 ```
+
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed.
 
 `--dry-run` works on every `macropad.py` subcommand and is the only way to verify frame
 construction without hardware. Use it when changing protocol code.
@@ -48,6 +51,18 @@ config" command, so the JSON files *are* the record of what's on the device.
 chords with the `keyboard` library and replays a recorded macro of arbitrary length. It imports
 `macropad` to program the device — it never speaks HID itself. State lives in `macros.json`
 (gitignored/untracked; created on first run).
+
+Two kinds of key assignment: a **chord-trigger binding** (`cfg["bindings"]`, keynum→macro; the
+key sends F13–F21 and the app replays a rich macro) and a **native shortcut** (`cfg["shortcuts"]`,
+keynum→`"ctrl+shift+s"`; the combo is written straight to firmware so the key sends it on any PC
+with no app). They're mutually exclusive per key. **Assign shortcut** captures a combo and
+programs it natively; `macro_as_keystrokes()` reduces recorded events (or a live capture) to
+`(modifier, keycode)` chords and powers both **Assign shortcut** and **Send to device**.
+
+Rich macros can't live on the device (write-only firmware — no read-back — and the 5-keystroke
+limit), so they travel with the config instead: `export_bundle`/`import_bundle` (Export/Import
+buttons) move macros+bindings+shortcuts as one JSON, and the portable `macros.json` sits beside
+the `.exe`.
 
 Its win32 layer (`ctypes` over `user32`/`kernel32`) does the app-context work:
 `ForegroundWatcher` samples the foreground window while recording and `app_at()` picks the app

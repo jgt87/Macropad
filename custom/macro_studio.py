@@ -21,6 +21,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -33,10 +34,34 @@ try:
 except ImportError:                   # keystroke-only mode; recording still works
     mouse = None
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+def _base_dir():
+    """Writable base: the folder holding the .exe when frozen, else the script dir.
+
+    In a PyInstaller onefile build __file__ points into a temp _MEIPASS dir that is
+    deleted on exit, so state files (macros.json, the rewritten layout.json) must live
+    next to the executable instead.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _bundle_dir():
+    """Read-only bundled data dir (_MEIPASS when frozen, else the base dir)."""
+    return getattr(sys, "_MEIPASS", _base_dir())
+
+
+HERE = _base_dir()
+BUNDLE_DIR = _bundle_dir()
 sys.path.insert(0, HERE)
+sys.path.insert(0, BUNDLE_DIR)
 CONFIG_PATH = os.path.join(HERE, "macros.json")
 LAYOUT_PATH = os.path.join(HERE, "layout.json")
+
+try:
+    from _version import __version__
+except Exception:
+    __version__ = "dev"
 
 FOCUS_DELAY = 0.35      # settle time after focusing an app that was already running
 LAUNCH_DELAY = 1.2      # extra settle time after a cold start (first paint is not "ready")
@@ -80,7 +105,8 @@ def load_config():
     else:
         cfg = {}
     cfg.setdefault("macros", {})      # name -> {"events": [...], "app": ""}
-    cfg.setdefault("bindings", {})    # keynum -> macro name
+    cfg.setdefault("bindings", {})    # keynum -> macro name (Macro Studio chord trigger)
+    cfg.setdefault("shortcuts", {})   # keynum -> "ctrl+shift+s" (native on-device combo)
     _migrate_macros(cfg)
     return cfg
 
@@ -104,19 +130,18 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-def record_in_layout(keynum, macro_name):
-    """Point layout.json's entry for `keynum` at the chord Bind just programmed.
+def _replace_layout_line(keynum, entry_obj):
+    """Rewrite layout.json's single-line entry for `keynum` to `entry_obj` (a dict).
 
     The firmware cannot report its own assignments, so layout.json is the only record of
-    what is actually on the device. A bind that reprograms a key without updating it
-    silently invalidates that record — and the next `macropad.py apply layout.json` would
-    quietly undo the bind.
+    what is actually on the device. Any code that reprograms a key must update it here too,
+    or the next `macropad.py apply layout.json` would quietly undo the change.
 
-    The file is hand-maintained (aligned columns, per-key notes), so rewrite only the one
-    entry's line instead of re-dumping the document. Returns a short status string.
-
-    Every failure is reported, never raised: this runs after the flash write has already
-    succeeded, and a bookkeeping problem must not look like a failed bind."""
+    The file is hand-maintained (aligned columns, per-key notes), so only the one entry's
+    line is rewritten - the document is never re-dumped. Serialised in the file's own
+    `{ "k": v, ... }` spacing. Every failure is reported, never raised: callers run this
+    after a flash write has already succeeded, and a bookkeeping slip must not look like a
+    failed operation."""
     if keynum not in CHORDS:
         return "layout.json not updated (unknown key %s)" % keynum
     try:
@@ -126,8 +151,8 @@ def record_in_layout(keynum, macro_name):
     except Exception as e:
         return "layout.json not updated (%s)" % e
 
-    entry = ('{ "type": "key", "keys": "%s", "note": "Macro Studio: %s" }'
-             % (chord_macropad_token(keynum), macro_name.replace('"', "'")))
+    inner = ", ".join('"%s": %s' % (k, json.dumps(v)) for k, v in entry_obj.items())
+    entry = "{ " + inner + " }"
     # matches a single-line entry, keeping its indent and the alignment after the colon
     pattern = re.compile(r'(?m)^(?P<pre>[ \t]*"%s"[ \t]*:[ \t]*)\{[^{}]*\}(?P<post>,?)[ \t]*$'
                          % re.escape(keynum))
@@ -144,6 +169,159 @@ def record_in_layout(keynum, macro_name):
     except Exception as e:
         return "layout.json not updated (%s)" % e
     return "layout.json updated"
+
+
+def record_in_layout(keynum, macro_name):
+    """Point layout.json's entry for `keynum` at the trigger Bind just programmed."""
+    return _replace_layout_line(keynum, {
+        "type": "key", "keys": chord_macropad_token(keynum),
+        "note": "Macro Studio: " + macro_name})
+
+
+DEFAULT_CONFIG_PATH = os.path.join(HERE, "default-config.json")
+
+
+def default_key_entry(keynum):
+    """The factory entry for `keynum` from default-config.json, or None."""
+    try:
+        with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)["keys"].get(keynum)
+    except Exception:
+        return None
+
+
+def default_key_desc(keynum):
+    """A short human label for a key's factory function, e.g. 'Copy' or 'ctrl+c'."""
+    e = default_key_entry(keynum) or {}
+    return e.get("note") or e.get("keys") or e.get("name") or "its default"
+
+
+def restore_key_default(keynum):
+    """Program `keynum` back to its factory function and record it in layout.json.
+
+    The firmware always emits *something*, so an unbound key can't be left silent - the
+    honest alternative is to give it back the job it had before Macro Studio took it over,
+    read from the read-only default-config.json. Returns (ok, message)."""
+    entry = default_key_entry(keynum)
+    if not entry:
+        return False, "no factory default known for key %s" % keynum
+    try:
+        import macropad as m
+        layer = 1
+        typ = entry.get("type", "key")
+        with m.Macropad() as mp:
+            if typ == "key":
+                ks = [m.parse_keystroke(t) for t in entry.get("keys", "").split()]
+                if not ks:
+                    return False, "default for key %s has no keystroke" % keynum
+                mp.set_keyboard(int(keynum), ks, layer=layer)
+            elif typ == "media":
+                mp.set_multimedia(int(keynum), m.MEDIA_CODES[entry["name"].lower()], layer=layer)
+            elif typ == "mouse":
+                mp.set_mouse(int(keynum), layer=layer, **m._mouse_from_action(entry["action"]))
+            else:
+                return False, "unknown default type %r for key %s" % (typ, keynum)
+    except Exception as e:
+        return False, "device not reprogrammed (%s)" % e
+    _replace_layout_line(keynum, entry)
+    return True, "restored to %s" % default_key_desc(keynum)
+
+
+# ---------------------------------------------------------------- portable binds
+# The device can't hold Macro Studio's binds: the firmware is write-only (nothing can read a
+# bind back to show it on another PC) and caps a key at five keystrokes with no timing, mouse,
+# or app focus. So binds travel between machines two ways instead - a config file that carries
+# everything (export/import, and the portable macros.json beside the .exe), and, for the few
+# binds simple enough to fit, burning them onto the device as native keys that work anywhere
+# with no app at all.
+def export_bundle(path, cfg):
+    """Write all macros + bindings + shortcuts to a file another PC's Macro Studio can import."""
+    bundle = {"macro_studio_binds": 1,
+              "macros": cfg.get("macros", {}),
+              "bindings": cfg.get("bindings", {}),
+              "shortcuts": cfg.get("shortcuts", {})}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(bundle, f, indent=2)
+
+
+def import_bundle(path):
+    """Read a file from export_bundle (or a raw macros.json) -> (macros, bindings, shortcuts)."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    macros = data.get("macros", {})
+    bindings = data.get("bindings", {})
+    shortcuts = data.get("shortcuts", {})
+    if not (isinstance(macros, dict) and isinstance(bindings, dict)
+            and isinstance(shortcuts, dict)):
+        raise ValueError("not a Macro Studio binds file")
+    return macros, bindings, shortcuts
+
+
+# keyboard-library event names -> the tokens macropad.py understands. Only the spellings that
+# differ need listing; letters, digits, f-keys, enter, etc. already match and pass through. An
+# unknown name makes a macro ineligible for the device - it is never burned as a wrong guess.
+_KB_MOD_ALIASES = {"windows": "win", "left windows": "win", "right windows": "win",
+                   "left ctrl": "ctrl", "right ctrl": "ctrl", "control": "ctrl",
+                   "left shift": "shift", "right shift": "shift",
+                   "left alt": "alt", "right alt": "alt", "alt gr": "alt"}
+_KB_KEY_ALIASES = {"page up": "pgup", "page down": "pgdn", "print screen": "printscreen",
+                   "caps lock": "capslock", "scroll lock": "scrolllock"}
+
+
+def macro_as_keystrokes(macro):
+    """If `macro` fits the firmware, return the (modifier_mask, hid_keycode) chords to burn on
+    the device; else None, so it stays a PC-side Macro Studio macro.
+
+    A key holds at most five (modifier, key) chords and replays them on press - no timing, no
+    mouse, no app focus. So only a short run of modified keystrokes, recorded with no app
+    context, can live on the device and travel on its own. The event stream is reduced to
+    chords: modifier presses accumulate a held mask, and each ordinary key-down emits one
+    chord carrying whatever modifiers are down. Anything unrepresentable - a mouse event, an
+    unknown key, a sixth keystroke - rejects the whole macro rather than burning an
+    approximation onto irreversible flash."""
+    try:
+        import macropad as m
+    except Exception:
+        return None
+    if macro.get("app"):
+        return None
+    strokes = []
+    held = 0
+    for ev in macro.get("events", []):
+        if ev.get("src") != "k":
+            return None
+        name = (ev.get("n") or "").lower().strip()
+        mod = m.MODIFIERS.get(_KB_MOD_ALIASES.get(name, name))
+        if mod is not None:
+            if ev.get("e") == "down":
+                held |= mod
+            elif ev.get("e") == "up":
+                held &= ~mod
+            continue
+        if ev.get("e") != "down":
+            continue
+        code = m.KEYCODES.get(_KB_KEY_ALIASES.get(name, name).replace(" ", ""))
+        if code is None:
+            return None
+        strokes.append((held, code))
+        if len(strokes) > 5:
+            return None
+    return strokes or None
+
+
+def keystroke_token(mod, code):
+    """A (modifier, keycode) chord -> a 'ctrl+shift+s' token (for layout.json and display)."""
+    import macropad as m
+    names = {v: k for k, v in m.KEYCODES.items()}
+    parts = [label for bit, label in ((m.MOD_CTRL, "ctrl"), (m.MOD_SHIFT, "shift"),
+                                       (m.MOD_ALT, "alt"), (m.MOD_WIN, "win")) if mod & bit]
+    parts.append(names.get(code, "0x%02x" % code))
+    return "+".join(parts)
+
+
+def keystrokes_text(strokes):
+    """A chord list -> the space-separated token string macropad.py applies, 'ctrl+c ctrl+v'."""
+    return " ".join(keystroke_token(mod, code) for mod, code in strokes)
 
 
 # ---------------------------------------------------------------- win32 helpers (app context)
@@ -223,17 +401,23 @@ def _pid_for_hwnd(hwnd):
     return pid.value
 
 
-def _window_origin(hwnd):
-    """Top-left of a window in screen coordinates, or None.
-
-    Clicks are stored relative to this so a macro still lands on the right control when
-    the app reopens somewhere else on screen."""
+def _window_rect(hwnd):
+    """(left, top, right, bottom) of a window in screen coordinates, or None."""
     if not hwnd:
         return None
     r = _RECT()
     if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
         return None
-    return r.left, r.top
+    return r.left, r.top, r.right, r.bottom
+
+
+def _window_origin(hwnd):
+    """Top-left of a window in screen coordinates, or None.
+
+    Clicks are stored relative to this so a macro still lands on the right control when
+    the app reopens somewhere else on screen."""
+    rect = _window_rect(hwnd)
+    return (rect[0], rect[1]) if rect else None
 
 
 def _is_own_window_at(x, y):
@@ -639,14 +823,33 @@ def serialize_events(key_events, mouse_events=()):
     return out
 
 
-def play_events(events, origin=None):
+CLICK_MARGIN = 8   # px of slack around the target window when validating a click
+
+
+def play_events(events, origin=None, bounds=None):
     """Replay a merged macro, preserving the original gaps between events.
 
     Written out rather than delegating to keyboard.play() because that can only replay
     keystrokes; interleaving clicks needs one loop driving both. `origin` is the target
     window's current top-left: when a click was recorded relative to a window, it is
     re-anchored here, so the macro follows the app rather than clicking blind screen
-    coordinates."""
+    coordinates.
+
+    `bounds` is that window's current rectangle (left, top, right, bottom). When given,
+    any click that resolves to a point outside it is dropped: a recording often opens with
+    the click that summoned the app (on the taskbar or another window), whose coordinates
+    no longer point at anything useful - replaying it lands on some unrelated window and,
+    worse, steals the foreground away from the app we just focused. ensure_app has already
+    put the target app in front, so a click that can't be placed on it is not ours to make."""
+    pressed = set()
+
+    def on_target(x, y):
+        if bounds is None:
+            return True
+        l, t, r, b = bounds
+        return (l - CLICK_MARGIN <= x <= r + CLICK_MARGIN
+                and t - CLICK_MARGIN <= y <= b + CLICK_MARGIN)
+
     last = None
     for d in events:
         t = d.get("t") or 0
@@ -671,15 +874,24 @@ def play_events(events, origin=None):
             x, y = origin[0] + rel[0], origin[1] + rel[1]
         else:
             x, y = d.get("x"), d.get("y")
-        if x is None or y is None:
+        if x is None or y is None or not on_target(x, y):
             continue
         mouse.move(x, y)
         # 'double' is a press too (its release is the following 'up'). New recordings never
         # store it - see MouseRecorder - but older ones might, so keep it a single press.
+        btn = d.get("b", "left")
         if d["e"] in ("down", "double"):
-            mouse.press(d.get("b", "left"))
+            mouse.press(btn)
+            pressed.add(btn)
         elif d["e"] == "up":
-            mouse.release(d.get("b", "left"))
+            mouse.release(btn)
+            pressed.discard(btn)
+
+    for btn in pressed:   # a down whose up was dropped must not leave the button held
+        try:
+            mouse.release(btn)
+        except Exception:
+            pass
 
 
 class Engine:
@@ -724,6 +936,7 @@ class Engine:
     def _play(self, macro):
         app = macro.get("app", "")
         origin = None
+        bounds = None
         if app:
             label = macro.get("app_exe") or os.path.basename(_split_command(app)[0])
             if not ensure_app(app, macro.get("app_pid", 0), macro.get("app_exe", "")):
@@ -731,9 +944,12 @@ class Engine:
                 self._status("Could not focus %s - macro not run" % label)
                 return
             # where the window sits *now*, so recorded clicks can be re-anchored to it
+            # (and clicks that fall outside it, like the one that first summoned the app,
+            # are dropped rather than replayed onto whatever is now at those coordinates)
             exe = macro.get("app_exe") or _split_command(app)[0]
             hwnd = _find_window_by_exe(exe)
             origin = _window_origin(hwnd)
+            bounds = _window_rect(hwnd)
             # final guard: focus can slip between ensure_app and here
             if not window_is_foreground(hwnd):
                 self._status("Lost focus on %s - macro not run" % label)
@@ -741,7 +957,7 @@ class Engine:
         # clear the trigger key's modifiers so they don't contaminate the macro
         release_modifiers()
         try:
-            play_events(macro["events"], origin)
+            play_events(macro["events"], origin, bounds)
         finally:
             # and clear anything the macro itself left held (a down with no matching up)
             release_modifiers()
@@ -773,12 +989,14 @@ PALETTES = {
         muted="#5d5d5d", accent="#0067c0", accent_hover="#0078d4", accent_text="#ffffff",
         btn="#fdfdfd", btn_hover="#f5f5f5", btn_press="#f0f0f0", btn_border="#d1d1d1",
         sel="#0067c0", sel_text="#ffffff",
+        btn_off="#f0f0f0", disabled="#a3a3a3",
     ),
     "dark": dict(
         bg="#202020", surface="#2b2b2b", border="#383838", text="#ffffff",
         muted="#c5c5c5", accent="#4cc2ff", accent_hover="#63cbff", accent_text="#000000",
         btn="#2d2d2d", btn_hover="#363636", btn_press="#3d3d3d", btn_border="#414141",
         sel="#4cc2ff", sel_text="#000000",
+        btn_off="#272727", disabled="#6f6f6f",
     ),
 }
 
@@ -874,6 +1092,81 @@ def system_accent(dark):
     return shade(4), shade(5), "#ffffff"        # dark fill, darker hover, white text
 
 
+def _rounded_photo(size, radius, fill, outline, ow):
+    """A rounded-rect RGBA PhotoImage, supersampled then downscaled for smooth corners.
+    Transparent outside the radius so the button's corners show the parent background.
+
+    Colour and alpha are built separately: a *solid* RGB image (fill everywhere, with the
+    outline drawn on top) carries the colour, and a one-channel mask carries the rounded
+    silhouette. Compositing fill over a transparent-black canvas and resampling RGBA
+    together makes LANCZOS ring at the fill->transparent edge - the RGB channels overshoot
+    toward white on a light fill, which showed up as white dots in the corners of the
+    borderless (disabled) buttons. Keeping the RGB solid means only alpha fades at the rim,
+    so the corners stay the fill colour and never flare white."""
+    from PIL import Image, ImageDraw, ImageTk
+    ss = 4
+    w = size * ss
+    inset = (ow * ss / 2.0) if outline else 0
+    box = [inset, inset, w - 1 - inset, w - 1 - inset]
+    rad = radius * ss
+
+    rgb = Image.new("RGB", (w, w), fill)
+    if outline and ow:
+        ImageDraw.Draw(rgb).rounded_rectangle(box, radius=rad, fill=fill,
+                                              outline=outline, width=max(1, ow) * ss)
+
+    mask = Image.new("L", (w, w), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(box, radius=rad, fill=255)
+
+    rgb = rgb.resize((size, size), Image.LANCZOS)
+    rgb.putalpha(mask.resize((size, size), Image.LANCZOS))
+    return ImageTk.PhotoImage(rgb)
+
+
+def _install_rounded_buttons(root, style, p, font):
+    """Give ttk buttons Windows 11's 4px rounded corners (Fluent 'Shapes and geometry').
+
+    clam only draws flat rectangles, so the corner radius comes from a themed 'image'
+    element: a rounded-rect sliced with a fixed-size border so ttk stretches the flat
+    middle and leaves the corners untouched at any button width. One image per visual
+    state, rendered at the current DPI so 4px stays 4px and the corners stay crisp. If
+    Pillow is missing the flat fallback style remains."""
+    try:
+        from PIL import Image  # noqa: F401 - presence check
+    except Exception:
+        return
+    r = max(4, round(4 * root.winfo_fpixels("1i") / 96.0))   # 4 logical px at this DPI
+    size = 2 * r + 3                                          # 3px stretchable centre
+    imgs = root._rbtn_imgs = {}                               # keep refs alive past return
+
+    def elem(name, states):
+        made = {st: _rounded_photo(size, r, *spec) for st, spec in states.items()}
+        imgs[name] = made
+        ordered = [made[""]] + [(st, made[st]) for st in ("disabled", "pressed", "active")
+                                if st in made]
+        style.element_create(name, "image", *ordered, border=r, sticky="nsew", padding=0)
+
+    elem("Rounded.button", {
+        "": (p["btn"], p["btn_border"], 1),
+        "active": (p["btn_hover"], p["btn_border"], 1),
+        "pressed": (p["btn_press"], p["btn_border"], 1),
+        # No outline when disabled: a contrasting rim on a fill that barely differs from
+        # the window background reads as a floating border, not a greyed-out button.
+        "disabled": (p["btn_off"], None, 0),
+    })
+    elem("RoundedAccent.button", {
+        "": (p["accent"], None, 0),
+        "active": (p["accent_hover"], None, 0),
+        "pressed": (p["accent"], None, 0),
+        "disabled": (p["btn_off"], None, 0),
+    })
+    for style_name, elem_name in (("TButton", "Rounded.button"),
+                                  ("Accent.TButton", "RoundedAccent.button")):
+        style.layout(style_name, [(elem_name, {"sticky": "nsew", "children": [
+            ("Button.padding", {"sticky": "nsew", "children": [
+                ("Button.label", {"sticky": "nsew"})]})]})])
+
+
 def apply_theme(root):
     """Style ttk from scratch on the 'clam' base and return (palette, fonts).
 
@@ -908,23 +1201,24 @@ def apply_theme(root):
     style.configure("Status.TLabel", background=p["surface"], foreground=p["muted"],
                     font=caption, padding=(12, 7))
 
-    style.configure("TButton", background=p["btn"], foreground=p["text"], font=body,
-                    borderwidth=1, relief="flat", padding=(14, 7),
-                    bordercolor=p["btn_border"], lightcolor=p["btn"], darkcolor=p["btn"])
-    style.map("TButton",
-              background=[("pressed", p["btn_press"]), ("active", p["btn_hover"])],
-              bordercolor=[("active", p["btn_border"])],
-              lightcolor=[("pressed", p["btn_press"]), ("active", p["btn_hover"])],
-              darkcolor=[("pressed", p["btn_press"]), ("active", p["btn_hover"])])
-
-    style.configure("Accent.TButton", background=p["accent"], foreground=p["accent_text"],
-                    bordercolor=p["accent"], lightcolor=p["accent"], darkcolor=p["accent"])
-    style.map("Accent.TButton",
-              background=[("pressed", p["accent"]), ("active", p["accent_hover"])],
-              foreground=[("pressed", p["accent_text"]), ("active", p["accent_text"])],
-              lightcolor=[("active", p["accent_hover"])],
-              darkcolor=[("active", p["accent_hover"])],
-              bordercolor=[("active", p["accent_hover"])])
+    # The rounded corners come from image elements installed below; here we set only what
+    # the button layout still reads - text colour, font, and the label's inset padding.
+    #
+    # `background` must be the colour of whatever the button sits on (the buttons live on
+    # plain TFrame bars, i.e. the window bg). The rounded image has transparent corners, so
+    # the field background shows through them; clam's default is a light grey, which flared
+    # as white brackets in the corners of the borderless (disabled) buttons. Every state is
+    # pinned, or clam's per-state map would put the light default back for disabled/active.
+    btn_bg = [("disabled", p["bg"]), ("active", p["bg"]), ("pressed", p["bg"])]
+    style.configure("TButton", foreground=p["text"], background=p["bg"], font=body,
+                    padding=(14, 7), anchor="center", borderwidth=0)
+    style.map("TButton", foreground=[("disabled", p["disabled"])], background=btn_bg)
+    style.configure("Accent.TButton", foreground=p["accent_text"], background=p["bg"],
+                    font=body, padding=(14, 7), anchor="center", borderwidth=0)
+    style.map("Accent.TButton", background=btn_bg,
+              foreground=[("disabled", p["disabled"]),
+                          ("pressed", p["accent_text"]), ("active", p["accent_text"])])
+    _install_rounded_buttons(root, style, p, body)
 
     # Win11 scrollbars are a thin thumb with no arrow buttons; drop them from the layout.
     style.layout("Thin.Vertical.TScrollbar", [
@@ -985,7 +1279,7 @@ def make_table(parent, columns, widths):
 # ---------------------------------------------------------------- GUI
 def run_gui(cfg, engine):
     import tkinter as tk
-    from tkinter import messagebox, simpledialog, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
 
     root = tk.Tk()
     root.title("Macro Studio")
@@ -1000,14 +1294,17 @@ def run_gui(cfg, engine):
     # the full-width status bar must be claimed BEFORE the side-by-side panes; otherwise
     # the panes take the whole height and the status bar lands in the leftover strip down
     # the right-hand side.
-    header = ttk.Frame(root, padding=(20, 16, 20, 8))
+    # header: title/subtitle on the left, the one global action (Record new) on the right.
+    # The button itself is created later, once record_new is defined, and packed into here.
+    header = ttk.Frame(root, padding=(20, 16, 20, 12))
     header.pack(side="top", fill="x")
-    ttk.Label(header, text="Macro Studio", style="Title.TLabel").pack(anchor="w")
-    ttk.Label(header, text="Record a macro, then bind it to a key on the macropad.",
+    htext = ttk.Frame(header)
+    htext.pack(side="left", fill="x", expand=True)
+    ttk.Label(htext, text="Macro Studio", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(htext, text="Record a macro, then bind it to a key on the macropad.",
               style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
 
-    bar = ttk.Frame(root, padding=(20, 0, 20, 12))
-    bar.pack(side="top", fill="x")
+    btns = {}   # action-name -> ttk.Button, so selection can enable/disable them
 
     status_wrap = ttk.Frame(root, style="Border.TFrame", padding=(0, 1, 0, 0))
     status_wrap.pack(side="bottom", fill="x")          # before the panes - see above
@@ -1028,6 +1325,17 @@ def run_gui(cfg, engine):
     macro_card.grid(row=1, column=0, sticky="nsew")
     key_card, key_list = make_table(panes, ("Key", "Bound macro"), (140, 180))
     key_card.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
+
+    # per-pane action bars: a button sitting under a pane plainly acts on that pane, which
+    # the old single toolbar left ambiguous. Filled once the handlers below exist.
+    macro_bar = ttk.Frame(panes)
+    macro_bar.grid(row=2, column=0, sticky="w", pady=(10, 0))
+    key_bar = ttk.Frame(panes)
+    key_bar.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(10, 0))
+    # a second key-pane row: "Send to device" is the occasional, advanced action (burn a
+    # simple bind onto the firmware), and four buttons would overflow the pane's width.
+    key_bar2 = ttk.Frame(panes)
+    key_bar2.grid(row=3, column=1, sticky="w", padx=(16, 0), pady=(8, 0))
 
     def set_status(msg):
         status.config(text=msg)
@@ -1051,13 +1359,18 @@ def run_gui(cfg, engine):
 
         key_list.delete(*key_list.get_children())
         for keynum in KEY_ORDER:
+            # a key is either a Macro Studio trigger (macro name) or a native on-device
+            # shortcut (shown with a keyboard glyph), never both
+            short = cfg["shortcuts"].get(keynum)
+            bound = cfg["bindings"].get(keynum) or (("⌨ " + short) if short else "—")
             key_list.insert("", "end", iid=keynum,
-                            values=(KEY_LABELS[keynum], cfg["bindings"].get(keynum, "—")))
+                            values=(KEY_LABELS[keynum], bound))
 
         for tree, sel in ((macro_list, macro_sel), (key_list, key_sel)):
             keep = [i for i in sel if tree.exists(i)]
             if keep:
                 tree.selection_set(keep)
+        update_states()
 
     def selected_macro():
         sel = macro_list.selection()
@@ -1066,6 +1379,34 @@ def run_gui(cfg, engine):
     def selected_keynum():
         sel = key_list.selection()
         return sel[0] if sel else None
+
+    def update_states(*_):
+        """Enable each action only when its target is selected - a Delete with no macro
+        chosen, or a Bind with no key, is simply not clickable. Safe to call before all
+        buttons exist (missing ones are skipped)."""
+        sel_macro = selected_macro()
+        has_macro = sel_macro is not None
+        keynum = selected_keynum()
+        # "used" = a chord-trigger binding OR a native shortcut; either can be cleared
+        key_used = keynum is not None and (keynum in cfg["bindings"]
+                                           or keynum in cfg["shortcuts"])
+        # only macros that fit the firmware (short, keyboard-only, no app) can be burned
+        simple = has_macro and macro_as_keystrokes(cfg["macros"][sel_macro]) is not None
+
+        def enable(name, on):
+            b = btns.get(name)
+            if b is not None:
+                b.state(["!disabled"] if on else ["disabled"])
+
+        for name in ("rename", "set_app", "test", "delete"):
+            enable(name, has_macro)
+        enable("bind", has_macro and keynum is not None)
+        enable("unbind", key_used)
+        # "Program key" re-arms the chord trigger; meaningless on a key that now holds a
+        # native shortcut (it sends the combo directly, not a trigger)
+        enable("program", keynum is not None and keynum not in cfg["shortcuts"])
+        enable("send_dev", simple and keynum is not None)
+        enable("assign_shortcut", keynum is not None)
 
     # --- recording ---
     def record_new():
@@ -1135,16 +1476,142 @@ def run_gui(cfg, engine):
                    command=stop).pack(anchor="w", pady=(16, 0))
         overlay.protocol("WM_DELETE_WINDOW", stop)
 
+    def capture_combo(prompt):
+        """Modal capture of a keyboard combination -> its (modifier, keycode) chords, or None.
+
+        The presses are reduced through the same path 'Send to device' uses, so the preview
+        is exactly what the firmware will send. Triggers are silenced during capture so a
+        macropad key can't fire a playback into it."""
+        win = tk.Toplevel(root)
+        win.title("Assign shortcut")
+        win.attributes("-topmost", True)
+        win.geometry("400x200")
+        win.configure(bg=p["bg"])
+        _use_dark_titlebar(win, not _system_uses_light_theme())
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=prompt, style="Title.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Press the keys, then Save. Up to 5 keystrokes; Clear to redo.\n"
+                             "(The combo also reaches the app behind this window.)",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
+        preview = ttk.Label(body, text="(press keys…)", style="Title.TLabel")
+        preview.pack(anchor="w", pady=(12, 0))
+
+        state = {"events": [], "strokes": None, "result": None}
+        engine.unregister_all()
+        release_modifiers()
+
+        def recompute():
+            state["strokes"] = macro_as_keystrokes(
+                {"events": serialize_events(state["events"]), "app": ""})
+            preview.config(text=keystrokes_text(state["strokes"]) if state["strokes"]
+                           else "(press keys…)")
+            save_btn.state(["!disabled"] if state["strokes"] else ["disabled"])
+
+        def on_key(e):
+            state["events"].append(e)
+            root.after(0, recompute)
+
+        hook = keyboard.hook(on_key)
+
+        def finish(save):
+            keyboard.unhook(hook)
+            release_modifiers()
+            engine.register_all()
+            state["result"] = state["strokes"] if save else None
+            win.destroy()
+
+        def clear():
+            state["events"] = []
+            recompute()
+
+        row = ttk.Frame(body)
+        row.pack(anchor="w", pady=(16, 0))
+        save_btn = ttk.Button(row, text="Save", style="Accent.TButton",
+                              command=lambda: finish(True))
+        save_btn.pack(side="left", padx=(0, 8))
+        save_btn.state(["disabled"])
+        ttk.Button(row, text="Clear", command=clear).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Cancel", command=lambda: finish(False)).pack(side="left")
+
+        win.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        win.grab_set()
+        win.wait_window()
+        return state["result"]
+
+    def assign_shortcut():
+        """Program the selected key to send a captured combination natively on the device.
+
+        Unlike Bind (a Macro Studio chord trigger the app replays), this writes the combo
+        straight to firmware, so the key sends it on ANY PC with no app - and it travels with
+        the device. It replaces whatever the key was doing (a key sends one thing)."""
+        keynum = selected_keynum()
+        if not keynum:
+            set_status("Select a key first"); return
+        strokes = capture_combo(f"Shortcut for {KEY_LABELS[keynum]}")
+        if not strokes:
+            return
+        text = keystrokes_text(strokes)
+        try:
+            import macropad as m
+            with m.Macropad() as mp:
+                mp.set_keyboard(int(keynum), strokes)
+        except Exception as e:
+            messagebox.showerror("Device error",
+                                 f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
+            return
+        _replace_layout_line(keynum, {"type": "key", "keys": text, "note": f"Shortcut: {text}"})
+        cfg["bindings"].pop(keynum, None)     # a key sends one thing: drop any chord trigger
+        cfg["shortcuts"][keynum] = text
+        save_config(cfg); engine.register_all(); refresh()
+        set_status(f"{KEY_LABELS[keynum]} now sends {text} directly - works on any PC")
+
+    def rename_macro():
+        old = selected_macro()
+        if not old:
+            set_status("Select a macro first"); return
+        new = simpledialog.askstring("Rename macro", "New name:",
+                                     initialvalue=old, parent=root)
+        if new is None:
+            return
+        new = new.strip()
+        if not new or new == old:
+            return
+        if new in cfg["macros"]:
+            set_status(f"A macro named '{new}' already exists"); return
+        cfg["macros"][new] = cfg["macros"].pop(old)
+        bound = [k for k, v in cfg["bindings"].items() if v == old]
+        for k in bound:
+            cfg["bindings"][k] = new
+        save_config(cfg); engine.register_all()
+        for k in bound:                       # keep the layout.json notes honest
+            record_in_layout(k, new)
+        refresh()
+        macro_list.selection_set(new)
+        set_status(f"Renamed '{old}' to '{new}'")
+
     def delete_macro():
         name = selected_macro()
         if not name:
+            set_status("Select a macro first"); return
+        bound = [k for k, v in cfg["bindings"].items() if v == name]
+        extra = (f"\n\nIt is bound to {len(bound)} key(s); those bindings will be removed."
+                 if bound else "")
+        if not messagebox.askyesno("Delete", f"Delete macro '{name}'?{extra}"):
             return
-        if messagebox.askyesno("Delete", f"Delete macro '{name}'?"):
-            cfg["macros"].pop(name, None)
-            for k, v in list(cfg["bindings"].items()):
-                if v == name:
-                    cfg["bindings"].pop(k)
-            save_config(cfg); engine.register_all(); refresh()
+        cfg["macros"].pop(name, None)
+        for k in bound:
+            cfg["bindings"].pop(k, None)
+        save_config(cfg); engine.register_all(); refresh()
+        # the freed keys still physically emit their triggers; offer to hand them back
+        # their normal function so the device doesn't keep firing dead triggers.
+        if bound and messagebox.askyesno(
+                "Restore keys",
+                f"Restore {len(bound)} freed key(s) to their default function on the device?"):
+            msgs = [f"{KEY_LABELS[k]} {restore_key_default(k)[1]}" for k in bound]
+            refresh()
+            set_status(f"Deleted '{name}'; " + "; ".join(msgs))
+        else:
             set_status(f"Deleted '{name}'")
 
     def set_app():
@@ -1184,6 +1651,7 @@ def run_gui(cfg, engine):
         if not name or not keynum:
             set_status("Select a macro AND a key"); return
         cfg["bindings"][keynum] = name
+        cfg["shortcuts"].pop(keynum, None)    # a key sends one thing: drop any native combo
         save_config(cfg); engine.register_all(); refresh()
         # Binding is only half the job: the listener above waits for the chord, but the
         # physical key sends nothing until the device is programmed to emit it. Doing both
@@ -1203,9 +1671,25 @@ def run_gui(cfg, engine):
         keynum = selected_keynum()
         if not keynum:
             return
-        cfg["bindings"].pop(keynum, None)
+        had_macro = cfg["bindings"].pop(keynum, None)
+        had_short = cfg["shortcuts"].pop(keynum, None)
         save_config(cfg); engine.register_all(); refresh()
-        set_status(f"Unbound {KEY_LABELS[keynum]}")
+        if had_macro is None and had_short is None:
+            set_status(f"{KEY_LABELS[keynum]} was not bound"); return
+        # the key still physically sends its trigger/shortcut; offer its normal job back
+        if messagebox.askyesno(
+                "Restore key",
+                f"Cleared {KEY_LABELS[keynum]}.\n\nRestore it to its default function "
+                f"({default_key_desc(keynum)}) on the device?"):
+            ok, msg = restore_key_default(keynum)
+            refresh()
+            set_status(f"Cleared {KEY_LABELS[keynum]} - {msg}")
+        elif had_short is not None:
+            set_status(f"Cleared {KEY_LABELS[keynum]} (device still sends {had_short} until"
+                       f" reprogrammed)")
+        else:
+            set_status(f"Unbound {KEY_LABELS[keynum]}"
+                       f" (key still sends {chord_macropad_token(keynum)})")
 
     def program_key():
         keynum = selected_keynum()
@@ -1220,14 +1704,125 @@ def run_gui(cfg, engine):
             messagebox.showerror("Device error",
                                  f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
 
-    # buttons (into the bar created above the panes). One accent button only, per Fluent:
-    # recording is the primary action, everything else acts on an existing macro.
-    ttk.Button(bar, text="Record new", style="Accent.TButton",
-               command=record_new).pack(side="left", padx=(0, 8))
-    for txt, fn in [("Delete", delete_macro), ("Set app…", set_app), ("Test", test_macro),
-                    ("Bind to key", bind), ("Unbind", unbind),
-                    ("Program key on device", program_key)]:
-        ttk.Button(bar, text=txt, command=fn).pack(side="left", padx=(0, 8))
+    def send_to_device():
+        """Burn the selected macro onto the selected key as native firmware keystrokes.
+
+        This is the one way a bind travels *with the device*: the key then types the chords
+        directly on any PC, no app running. It's mutually exclusive with a Macro Studio
+        trigger (a key sends one thing), so it drops the app-side binding for that key."""
+        name = selected_macro(); keynum = selected_keynum()
+        if not name or not keynum:
+            set_status("Select a macro AND a key"); return
+        strokes = macro_as_keystrokes(cfg["macros"][name])
+        if not strokes:
+            set_status(f"'{name}' is too complex for the device "
+                       "(needs <=5 keystrokes, no mouse, no app)"); return
+        human = keystrokes_text(strokes)
+        if not messagebox.askyesno(
+                "Send to device",
+                f"Program {KEY_LABELS[keynum]} to type\n\n    {human}\n\n"
+                "directly onto the macropad's flash?\n\n"
+                "• Works on ANY PC with no app running, and travels with the device.\n"
+                f"• {KEY_LABELS[keynum]} will no longer trigger '{name}' through Macro "
+                "Studio (so no timing or app focus).\n\nContinue?"):
+            return
+        try:
+            import macropad as m
+            with m.Macropad() as mp:
+                mp.set_keyboard(int(keynum), strokes)
+        except Exception as e:
+            messagebox.showerror("Device error",
+                                 f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
+            return
+        _replace_layout_line(keynum, {"type": "key", "keys": human,
+                                      "note": f"On-device: {name}"})
+        cfg["bindings"].pop(keynum, None)     # no longer a chord trigger; it's native now
+        cfg["shortcuts"][keynum] = human      # show it as an on-device combo in the key pane
+        save_config(cfg); engine.register_all(); refresh()
+        set_status(f"Sent '{name}' to {KEY_LABELS[keynum]} - it now types {human} on any PC")
+
+    def export_binds():
+        if not cfg["macros"]:
+            set_status("No macros to export yet"); return
+        path = filedialog.asksaveasfilename(
+            parent=root, title="Export binds", defaultextension=".json",
+            initialfile="macro-studio-binds.json",
+            filetypes=[("Macro Studio binds", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            export_bundle(path, cfg)
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e)); return
+        set_status(f"Exported {len(cfg['macros'])} macro(s) to {os.path.basename(path)}")
+
+    def import_binds():
+        path = filedialog.askopenfilename(
+            parent=root, title="Import binds",
+            filetypes=[("Macro Studio binds", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            macros, bindings, shortcuts = import_bundle(path)
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Could not read that file:\n{e}"); return
+        if not macros and not shortcuts:
+            set_status("That file had no binds"); return
+        clash = [n for n in macros if n in cfg["macros"]]
+        if clash and not messagebox.askyesno(
+                "Import binds",
+                f"Import {len(macros)} macro(s)?\n\n{len(clash)} will overwrite macros of the "
+                "same name here.\n\nThe device is not reprogrammed - use 'Program key' (chord "
+                "binds) or 'Assign shortcut' (native combos) afterwards to arm the keys here."):
+            return
+        cfg["macros"].update(macros)
+        cfg["bindings"].update(bindings)
+        cfg["shortcuts"].update(shortcuts)
+        # a key can't be both: an imported native shortcut wins over a stale chord binding
+        for k in shortcuts:
+            cfg["bindings"].pop(k, None)
+        save_config(cfg); engine.register_all(); refresh()
+        set_status(f"Imported {len(macros)} macro(s), {len(shortcuts)} shortcut(s) - "
+                   "arm the device with 'Program key' / 'Assign shortcut'")
+
+    def add_button(parent, name, txt, fn, accent=False):
+        b = ttk.Button(parent, text=txt, command=fn,
+                       style="Accent.TButton" if accent else "TButton")
+        b.pack(side="left", padx=(0, 8))
+        btns[name] = b
+
+    # Record new is the one global action (creates a macro, doesn't act on a selection),
+    # so it lives in the header as the single accent button - Fluent's one-primary rule.
+    # Export/Import sit beside it: they move the whole bind set between PCs (side="right"
+    # stacks right-to-left, so these land to the left of Record).
+    btns["record"] = ttk.Button(header, text="Record new", style="Accent.TButton",
+                                command=record_new)
+    btns["record"].pack(side="right", anchor="n")
+    btns["import"] = ttk.Button(header, text="Import…", command=import_binds)
+    btns["import"].pack(side="right", anchor="n", padx=(0, 8))
+    btns["export"] = ttk.Button(header, text="Export…", command=export_binds)
+    btns["export"].pack(side="right", anchor="n", padx=(0, 8))
+
+    # macro-pane actions, then key-pane actions - each under the list it operates on
+    add_button(macro_bar, "rename", "Rename", rename_macro)
+    add_button(macro_bar, "set_app", "Set app…", set_app)
+    add_button(macro_bar, "test", "Test", test_macro)
+    add_button(macro_bar, "delete", "Delete", delete_macro)
+    add_button(key_bar, "bind", "Bind to key", bind)
+    add_button(key_bar, "unbind", "Unbind", unbind)
+    add_button(key_bar, "program", "Program key", program_key)
+    add_button(key_bar2, "assign_shortcut", "Assign shortcut", assign_shortcut, accent=True)
+    add_button(key_bar2, "send_dev", "Send to device", send_to_device)
+
+    # keep buttons in step with the selection, and offer the native direct interactions
+    macro_list.bind("<<TreeviewSelect>>", update_states)
+    key_list.bind("<<TreeviewSelect>>", update_states)
+    macro_list.bind("<Double-1>", lambda e: test_macro())
+    macro_list.bind("<Return>", lambda e: test_macro())
+    macro_list.bind("<Delete>", lambda e: delete_macro())
+    key_list.bind("<Double-1>", lambda e: bind())
+    key_list.bind("<Return>", lambda e: bind())
+    key_list.bind("<Delete>", lambda e: unbind())
 
     refresh()
 
@@ -1250,11 +1845,20 @@ def run_gui(cfg, engine):
             icon.stop()
             root.after(0, root.destroy)
 
+        def open_config_folder(icon=None, item=None):
+            # macros.json lives beside the .exe (portable) - open its folder so the config
+            # is easy to copy onto another machine or a USB stick.
+            try:
+                os.startfile(os.path.dirname(CONFIG_PATH))
+            except Exception:
+                pass
+
         menu = pystray.Menu(
             pystray.MenuItem("Open Macro Studio", show, default=True),
+            pystray.MenuItem("Open config folder", open_config_folder),
             pystray.MenuItem("Exit", quit_all),
         )
-        icon = pystray.Icon("MacroStudio", img, "Macro Studio", menu)
+        icon = pystray.Icon("MacroStudio", img, "Macro Studio v%s" % __version__, menu)
         threading.Thread(target=icon.run, daemon=True).start()
         return icon
 
@@ -1268,7 +1872,32 @@ def run_gui(cfg, engine):
 
 
 # ---------------------------------------------------------------- entry
+def _seed_data_files():
+    """On a frozen build, copy bundled defaults next to the exe on first run.
+
+    layout.json and default-config.json ship inside the exe (read-only in _MEIPASS);
+    the app needs writable copies beside the exe because layout.json is rewritten and
+    the JSON files are the only record of what is programmed on the device.
+    """
+    if BUNDLE_DIR == HERE:
+        return
+    for name in ("layout.json", "default-config.json"):
+        dst = os.path.join(HERE, name)
+        if os.path.exists(dst):
+            continue
+        src = os.path.join(BUNDLE_DIR, name)
+        if os.path.exists(src):
+            try:
+                shutil.copyfile(src, dst)
+            except Exception:
+                pass
+
+
 def main():
+    if "--version" in sys.argv:
+        print("Macro Studio", __version__)
+        return
+    _seed_data_files()
     cfg = load_config()
     engine = Engine(cfg)
     engine.register_all()

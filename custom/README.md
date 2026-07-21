@@ -124,6 +124,38 @@ How it works: each key sends a unique chord it listens for — **Keys 1–6 → 
 - Notes: keystroke macros only (no mouse); global hooks may need the app run as admin to
   catch every key.
 
+## Bind a key to a keyboard combination
+
+Select a key and click **Assign shortcut**, then press the combination (e.g. `Ctrl+Shift+S`, or
+a short sequence like `Ctrl+C Ctrl+V`). Macro Studio programs that combo **straight onto the
+device**, so the key sends it on **any** PC with no app running — and it travels with the pad.
+This is the direct alternative to *record a macro → bind*: no recording, no chord trigger, no
+app. It's limited to what the firmware holds (≤5 keystrokes, keyboard only); anything richer
+stays a recorded macro. Assigning a shortcut replaces whatever the key did (a key sends one
+thing); **Unbind** clears it.
+
+## Moving binds to another PC
+
+The firmware can't hold Macro Studio's *macros* — it's **write-only** (nothing can read a bind
+back to show it elsewhere) and a key stores at most **5 keystrokes** with no timing, mouse, or
+app focus. So macros travel with the *config*, three ways:
+
+- **Carry the portable copy.** `macros.json` lives next to `MacroStudio.exe`. Put that folder
+  on a USB stick (or copy it to the other PC) and your binds show up there. The tray menu's
+  **Open config folder** opens exactly this folder.
+- **Export / Import.** **Export…** writes all macros + bindings to one `.json`; **Import…**
+  loads it on another install (then use **Program key** to arm the physical keys there).
+- **Send to device.** For a bind that's simple enough to fit the firmware (≤5 keystrokes, no
+  mouse, no app context), **Send to device** burns it onto the key as a *native* assignment —
+  that key then works on **any** PC with no app running, and travels with the device. It
+  replaces the Macro Studio trigger for that key (a key sends only one thing).
+
+## Building the executable
+
+From `custom/`, run `powershell -ExecutionPolicy Bypass -File build.ps1` to produce
+`dist/MacroStudio.exe`. Pushing a `vX.Y.Z` tag makes GitHub Actions build the app and
+attach `MacroStudio-vX.Y.Z.exe` to the release.
+
 ### Legacy: Macropad Helper (AutoHotkey) — retired
 
 `macropad-helper.ahk` was an earlier, simpler pop-up-menu approach (trigger `Ctrl+Alt+Win+F12`).
