@@ -1362,10 +1362,10 @@ def run_gui(cfg, engine):
     key_card, key_list = make_table(panes, ("Key", "Sends", "Runs macro"), (120, 100, 140))
     key_card.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
 
-    # Key-pane actions are buttons; macro actions live on a right-click context menu (built
-    # once the handlers below exist), so the macro pane just carries a discovery hint here.
-    ttk.Label(panes, text="Right-click a macro to rename, set its app, test, or delete.",
-              style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=(10, 0))
+    # Bottom-left bar holds the global actions (Record new / Export / Import); per-macro
+    # actions live on a right-click context menu. Key-pane actions sit under the key list.
+    macro_bar = ttk.Frame(panes)
+    macro_bar.grid(row=2, column=0, sticky="w", pady=(10, 0))
     key_bar = ttk.Frame(panes)
     key_bar.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(10, 0))
 
@@ -1839,17 +1839,15 @@ def run_gui(cfg, engine):
         b.pack(side="left", padx=(0, 8))
         btns[name] = b
 
-    # Record new is the one global action (creates a macro, doesn't act on a selection),
-    # so it lives in the header as the single accent button - Fluent's one-primary rule.
-    # Export/Import sit beside it: they move the whole bind set between PCs (side="right"
-    # stacks right-to-left, so these land to the left of Record).
-    btns["record"] = ttk.Button(header, text="Record new", style="Accent.TButton",
+    # Global actions in the bottom-left bar, under the macro list. Record new is the single
+    # accent button (Fluent's one-primary rule); Export/Import move the whole bind set.
+    btns["record"] = ttk.Button(macro_bar, text="Record new", style="Accent.TButton",
                                 command=record_new)
-    btns["record"].pack(side="right", anchor="n")
-    btns["import"] = ttk.Button(header, text="Import…", command=import_binds)
-    btns["import"].pack(side="right", anchor="n", padx=(0, 8))
-    btns["export"] = ttk.Button(header, text="Export…", command=export_binds)
-    btns["export"].pack(side="right", anchor="n", padx=(0, 8))
+    btns["record"].pack(side="left", padx=(0, 8))
+    btns["export"] = ttk.Button(macro_bar, text="Export…", command=export_binds)
+    btns["export"].pack(side="left", padx=(0, 8))
+    btns["import"] = ttk.Button(macro_bar, text="Import…", command=import_binds)
+    btns["import"].pack(side="left")
 
     # macro-pane actions, then key-pane actions - each under the list it operates on
     add_button(key_bar, "bind", "Map Macro", bind)
