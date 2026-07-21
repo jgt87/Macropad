@@ -106,14 +106,23 @@ keystroke macros, **bind** them to macropad keys, and **run** them — with opti
 application context (launch/focus an app first). This gets past the 5-keystroke limit and
 lets one key do long/app-aware actions.
 
-How it works: each key sends a unique chord it listens for — **Keys 1–6 → Ctrl+Alt+Win+F1–F6**,
-**knob 13/14/15 → F7–F9** (these never collide with normal shortcuts).
+How it works — **two independent layers per key**, shown as the *Sends* and *Runs macro* columns:
 
-- **Install deps** (one-time): `pip install hidapi keyboard pystray Pillow`
-- **Run:** `pythonw macro_studio.py` (auto-starts via a Startup-folder shortcut).
-- **Workflow:** Record New → select macro + key → Bind →Key → Program Key on Device. Then
-  press that macropad key to run the macro. Use **Test** to try without the pad. Closing the
-  window hides it to the tray.
+1. **Sends (device):** what the physical key is programmed to emit — a real combo like `Ctrl+C`,
+   or a *trigger key* `F13`–`F24` (no keyboard has these, so nothing else ever sends them). Set
+   with **Bind to key**; written to the pad's flash, so it works on any PC.
+2. **Runs macro (app):** the recorded macro the app plays when it *detects* that sent key. Set
+   with **Map Macro**. So: press the pad key → it sends e.g. `F13` → the running app catches
+   `F13` and replays the macro. This is what gets past the 5-keystroke limit and adds app-context.
+
+- **Run it, either way:**
+  - **Packaged (no Python):** grab `MacroStudio.exe` (from a release, or build it — see below)
+    and double-click it. It's a single portable file; its `macros.json` config lives next to it.
+  - **From source:** `pip install hidapi keyboard pystray Pillow`, then `pythonw macro_studio.py`
+    (auto-starts via a Startup-folder shortcut).
+- **Workflow:** Record New → select the macro + a key → **Map Macro**. That auto-assigns the key
+  its default trigger (`F13`–`F21`) and programs the pad, then links the macro. Press the key to
+  run it. Use **Test** to try without the pad. Closing the window hides it to the tray.
 - **App context is automatic.** While recording, click into the application you want the
   macro to run in — Macro Studio notes which process had focus when your first keystroke
   landed and binds the macro to that executable. At playback it focuses that app first, and
@@ -126,29 +135,28 @@ How it works: each key sends a unique chord it listens for — **Keys 1–6 → 
 
 ## Bind a key to a keyboard combination
 
-Select a key and click **Assign shortcut**, then press the combination (e.g. `Ctrl+Shift+S`, or
-a short sequence like `Ctrl+C Ctrl+V`). Macro Studio programs that combo **straight onto the
-device**, so the key sends it on **any** PC with no app running — and it travels with the pad.
-This is the direct alternative to *record a macro → bind*: no recording, no chord trigger, no
-app. It's limited to what the firmware holds (≤5 keystrokes, keyboard only); anything richer
-stays a recorded macro. Assigning a shortcut replaces whatever the key did (a key sends one
-thing); **Unbind** clears it.
+Select a key and click **Bind to key**, then either press the combination (e.g. `Ctrl+Shift+S`,
+or a short sequence like `Ctrl+C Ctrl+V`) **or** pick a trigger key `F13`–`F24` from the list
+(those have no physical key, so you can't press them). Macro Studio programs it **straight onto
+the pad's flash**, so the key sends it on **any** PC with no app running — it travels with the
+device. Use a real combo when you want the key to *do* that thing everywhere; use an `F13`+
+trigger when you want it to drive a macro (then link one with **Map Macro** — the two coexist).
+**Unbind** clears the key.
 
 ## Moving binds to another PC
 
 The firmware can't hold Macro Studio's *macros* — it's **write-only** (nothing can read a bind
 back to show it elsewhere) and a key stores at most **5 keystrokes** with no timing, mouse, or
-app focus. So macros travel with the *config*, three ways:
+app focus. So macros travel with the *config*, two ways:
 
 - **Carry the portable copy.** `macros.json` lives next to `MacroStudio.exe`. Put that folder
   on a USB stick (or copy it to the other PC) and your binds show up there. The tray menu's
   **Open config folder** opens exactly this folder.
 - **Export / Import.** **Export…** writes all macros + bindings to one `.json`; **Import…**
-  loads it on another install (then use **Program key** to arm the physical keys there).
-- **Send to device.** For a bind that's simple enough to fit the firmware (≤5 keystrokes, no
-  mouse, no app context), **Send to device** burns it onto the key as a *native* assignment —
-  that key then works on **any** PC with no app running, and travels with the device. It
-  replaces the Macro Studio trigger for that key (a key sends only one thing).
+  loads it on another install (then use **Map Macro** to arm the physical keys there).
+
+(Simple combos set with **Bind to key** don't need any of this — they're written to the
+device's own flash, so they already travel with the pad to any PC on their own.)
 
 ## Building the executable
 

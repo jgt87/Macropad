@@ -52,12 +52,18 @@ chords with the `keyboard` library and replays a recorded macro of arbitrary len
 `macropad` to program the device — it never speaks HID itself. State lives in `macros.json`
 (gitignored/untracked; created on first run).
 
-Two kinds of key assignment: a **chord-trigger binding** (`cfg["bindings"]`, keynum→macro; the
-key sends F13–F21 and the app replays a rich macro) and a **native shortcut** (`cfg["shortcuts"]`,
-keynum→`"ctrl+shift+s"`; the combo is written straight to firmware so the key sends it on any PC
-with no app). They're mutually exclusive per key. **Assign shortcut** captures a combo and
-programs it natively; `macro_as_keystrokes()` reduces recorded events (or a live capture) to
-`(modifier, keycode)` chords and powers both **Assign shortcut** and **Send to device**.
+**Two independent layers per key, which coexist.** *Layer 1 (device)* — `cfg["shortcuts"][keynum]`
+is what the physical key is programmed to **send** (a real combo like `ctrl+c`, or a trigger key
+`f13`–`f24` that has no physical key so nothing else emits it), written to flash by **Bind to
+key**. *Layer 2 (app)* — `cfg["bindings"][keynum]` is the macro the app **runs** when it detects
+that sent key, linked by **Map Macro**. `Engine.register_all` arms a `keyboard` hotkey on each
+key's *sent* value (layer 1) that also has a linked macro (layer 2): press the pad key → it sends
+e.g. `f13` → the running app catches `f13` and replays the macro. **Map Macro** auto-assigns the
+default `F13`–`F21` trigger (`CHORDS`) and programs it when the key sends nothing yet; **Bind to
+key** overrides what the key sends (captured combo, or an `F13`–`F24` picked from a list since
+they can't be pressed). The old fixed-`CHORDS` bindings are migrated to explicit `shortcuts` on
+load. `macro_as_keystrokes()` reduces a live capture to the `(modifier, keycode)` chords the
+firmware stores.
 
 Rich macros can't live on the device (write-only firmware — no read-back — and the 5-keystroke
 limit), so they travel with the config instead: `export_bundle`/`import_bundle` (Export/Import

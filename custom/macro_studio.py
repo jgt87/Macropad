@@ -70,7 +70,8 @@ LAUNCH_POLL = 0.25      # how often to look for that window
 FOREGROUND_POLL = 0.2   # how often to sample the foreground window while recording
 MAX_EVENT_GAP = 2.0     # cap replayed idle time: thinking pauses shouldn't be re-lived
 
-# Each macropad key number -> the "exotic" key it sends and we listen for.
+# Each macropad key number -> its DEFAULT trigger key. Map Macro assigns this (and programs
+# the pad to send it) when a key has no "sends" yet; Bind to key can override what a key sends.
 #
 # F13..F21 (single keys, no modifiers) rather than the old Ctrl+Alt+Win+Fn chords: those
 # collided with reserved Windows shortcuts - Win+F1 opens Help, and Windows swallows the
@@ -105,8 +106,13 @@ def load_config():
     else:
         cfg = {}
     cfg.setdefault("macros", {})      # name -> {"events": [...], "app": ""}
-    cfg.setdefault("bindings", {})    # keynum -> macro name (Macro Studio chord trigger)
-    cfg.setdefault("shortcuts", {})   # keynum -> "ctrl+shift+s" (native on-device combo)
+    cfg.setdefault("bindings", {})    # keynum -> macro name the app runs (layer 2)
+    cfg.setdefault("shortcuts", {})   # keynum -> what the key sends, e.g. "f13" / "ctrl+c" (layer 1)
+    # Migration: before the two layers were split, a mapped macro triggered on the fixed
+    # CHORDS[keynum]. Record that as the key's "sends" so those binds keep firing.
+    for keynum in cfg["bindings"]:
+        if keynum in CHORDS:
+            cfg["shortcuts"].setdefault(keynum, CHORDS[keynum])
     _migrate_macros(cfg)
     return cfg
 
@@ -908,15 +914,27 @@ class Engine:
                 pass
 
     def register_all(self):
-        self.unregister_all()
-        for keynum, macro_name in self.cfg["bindings"].items():
-            if macro_name in self.cfg["macros"] and keynum in CHORDS:
-                self._register(keynum, macro_name)
+        """Arm a listener for every key that both *sends* something and has a macro linked.
 
-    def _register(self, keynum, macro_name):
-        chord = CHORDS[keynum]
-        handle = keyboard.add_hotkey(chord, self._run, args=(macro_name,),
-                                     suppress=False, trigger_on_release=False)
+        Layer 1 is what the macropad key is programmed to emit (cfg["shortcuts"][keynum], e.g.
+        "f13"); layer 2 is the macro linked to it (cfg["bindings"][keynum]). At runtime the key
+        sends its keystroke and - if this app is running - we detect it and replay the macro."""
+        self.unregister_all()
+        shortcuts = self.cfg.get("shortcuts", {})
+        for keynum, macro_name in self.cfg["bindings"].items():
+            trigger = shortcuts.get(keynum)
+            if trigger and macro_name in self.cfg["macros"]:
+                self._register(keynum, trigger, macro_name)
+
+    def _register(self, keynum, trigger, macro_name):
+        # `trigger` is exactly what the key sends ("f13", "ctrl+alt+x", ...). A native multi-key
+        # sequence ("ctrl+c ctrl+v") isn't a hotkey the OS can fire on, so add_hotkey rejects it
+        # and that key just performs its keystrokes without triggering a macro.
+        try:
+            handle = keyboard.add_hotkey(trigger, self._run, args=(macro_name,),
+                                         suppress=False, trigger_on_release=False)
+        except Exception:
+            return
         self._registered[keynum] = handle
 
     def unregister_all(self):
@@ -1285,7 +1303,8 @@ def run_gui(cfg, engine):
     root.title("Macro Studio")
     p, fonts = apply_theme(root)
     root.geometry("960x540")
-    root.minsize(760, 420)
+    # minsize is set from the built layout further down (see set_min_size), so the window can
+    # never be dragged smaller than the point where its buttons stay fully visible.
 
     recording = {"events": None, "hook": None, "watcher": None, "mouse": None}
 
@@ -1323,7 +1342,7 @@ def run_gui(cfg, engine):
 
     macro_card, macro_list = make_table(panes, ("Name", "Application"), (170, 150))
     macro_card.grid(row=1, column=0, sticky="nsew")
-    key_card, key_list = make_table(panes, ("Key", "Bound macro"), (140, 180))
+    key_card, key_list = make_table(panes, ("Key", "Sends", "Runs macro"), (120, 100, 140))
     key_card.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
 
     # per-pane action bars: a button sitting under a pane plainly acts on that pane, which
@@ -1332,10 +1351,6 @@ def run_gui(cfg, engine):
     macro_bar.grid(row=2, column=0, sticky="w", pady=(10, 0))
     key_bar = ttk.Frame(panes)
     key_bar.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(10, 0))
-    # a second key-pane row: "Send to device" is the occasional, advanced action (burn a
-    # simple bind onto the firmware), and four buttons would overflow the pane's width.
-    key_bar2 = ttk.Frame(panes)
-    key_bar2.grid(row=3, column=1, sticky="w", padx=(16, 0), pady=(8, 0))
 
     def set_status(msg):
         status.config(text=msg)
@@ -1359,12 +1374,12 @@ def run_gui(cfg, engine):
 
         key_list.delete(*key_list.get_children())
         for keynum in KEY_ORDER:
-            # a key is either a Macro Studio trigger (macro name) or a native on-device
-            # shortcut (shown with a keyboard glyph), never both
-            short = cfg["shortcuts"].get(keynum)
-            bound = cfg["bindings"].get(keynum) or (("⌨ " + short) if short else "—")
+            # two independent layers: what the key sends (device) and the macro the app runs
+            # when it detects that (app). Either, both, or neither may be set.
+            sends = cfg["shortcuts"].get(keynum) or "—"
+            runs = cfg["bindings"].get(keynum) or "—"
             key_list.insert("", "end", iid=keynum,
-                            values=(KEY_LABELS[keynum], bound))
+                            values=(KEY_LABELS[keynum], sends, runs))
 
         for tree, sel in ((macro_list, macro_sel), (key_list, key_sel)):
             keep = [i for i in sel if tree.exists(i)]
@@ -1390,8 +1405,6 @@ def run_gui(cfg, engine):
         # "used" = a chord-trigger binding OR a native shortcut; either can be cleared
         key_used = keynum is not None and (keynum in cfg["bindings"]
                                            or keynum in cfg["shortcuts"])
-        # only macros that fit the firmware (short, keyboard-only, no app) can be burned
-        simple = has_macro and macro_as_keystrokes(cfg["macros"][sel_macro]) is not None
 
         def enable(name, on):
             b = btns.get(name)
@@ -1402,10 +1415,6 @@ def run_gui(cfg, engine):
             enable(name, has_macro)
         enable("bind", has_macro and keynum is not None)
         enable("unbind", key_used)
-        # "Program key" re-arms the chord trigger; meaningless on a key that now holds a
-        # native shortcut (it sends the combo directly, not a trigger)
-        enable("program", keynum is not None and keynum not in cfg["shortcuts"])
-        enable("send_dev", simple and keynum is not None)
         enable("assign_shortcut", keynum is not None)
 
     # --- recording ---
@@ -1479,13 +1488,13 @@ def run_gui(cfg, engine):
     def capture_combo(prompt):
         """Modal capture of a keyboard combination -> its (modifier, keycode) chords, or None.
 
-        The presses are reduced through the same path 'Send to device' uses, so the preview
-        is exactly what the firmware will send. Triggers are silenced during capture so a
+        The presses are reduced to the (modifier, keycode) chords the firmware stores, so the
+        preview is exactly what it will send. Triggers are silenced during capture so a
         macropad key can't fire a playback into it."""
         win = tk.Toplevel(root)
-        win.title("Assign shortcut")
+        win.title("Bind to key")
         win.attributes("-topmost", True)
-        win.geometry("400x200")
+        win.geometry("420x250")
         win.configure(bg=p["bg"])
         _use_dark_titlebar(win, not _system_uses_light_theme())
         body = ttk.Frame(win, padding=20)
@@ -1514,6 +1523,26 @@ def run_gui(cfg, engine):
 
         hook = keyboard.hook(on_key)
 
+        # F13..F24 have no physical key, so they can't be pressed - offer them as a picker.
+        # They're the ideal macro trigger: the app can detect them and nothing else sends them.
+        trig_row = ttk.Frame(body)
+        trig_row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(trig_row, text="…or a trigger key (for macros):",
+                  style="Muted.TLabel").pack(side="left")
+        trig = ttk.Combobox(trig_row, width=6, state="readonly",
+                            values=["F%d" % n for n in range(13, 25)])
+        trig.pack(side="left", padx=(8, 0))
+
+        def pick_trigger(_=None):
+            import macropad as m
+            fn = trig.get().lower()
+            state["events"] = []                       # a picked trigger replaces any presses
+            state["strokes"] = [(0, m.KEYCODES[fn])]
+            preview.config(text=fn)
+            save_btn.state(["!disabled"])
+
+        trig.bind("<<ComboboxSelected>>", pick_trigger)
+
         def finish(save):
             keyboard.unhook(hook)
             release_modifiers()
@@ -1540,15 +1569,16 @@ def run_gui(cfg, engine):
         return state["result"]
 
     def assign_shortcut():
-        """Program the selected key to send a captured combination natively on the device.
+        """Bind to key (layer 1): program the selected key to *send* a chosen keystroke.
 
-        Unlike Bind (a Macro Studio chord trigger the app replays), this writes the combo
-        straight to firmware, so the key sends it on ANY PC with no app - and it travels with
-        the device. It replaces whatever the key was doing (a key sends one thing)."""
+        Capture a real combo, or pick a trigger key (F13..F24 - no physical key sends them, so
+        they're collision-proof macro triggers). Written to the pad's flash, so it sends this on
+        any PC with no app. If a macro is linked to this key (layer 2), the app now listens for
+        this new keystroke instead - the two coexist."""
         keynum = selected_keynum()
         if not keynum:
             set_status("Select a key first"); return
-        strokes = capture_combo(f"Shortcut for {KEY_LABELS[keynum]}")
+        strokes = capture_combo(f"What should {KEY_LABELS[keynum]} send?")
         if not strokes:
             return
         text = keystrokes_text(strokes)
@@ -1560,11 +1590,14 @@ def run_gui(cfg, engine):
             messagebox.showerror("Device error",
                                  f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
             return
-        _replace_layout_line(keynum, {"type": "key", "keys": text, "note": f"Shortcut: {text}"})
-        cfg["bindings"].pop(keynum, None)     # a key sends one thing: drop any chord trigger
-        cfg["shortcuts"][keynum] = text
-        save_config(cfg); engine.register_all(); refresh()
-        set_status(f"{KEY_LABELS[keynum]} now sends {text} directly - works on any PC")
+        _replace_layout_line(keynum, {"type": "key", "keys": text, "note": f"Sends: {text}"})
+        cfg["shortcuts"][keynum] = text       # layer 1; any linked macro (layer 2) stays
+        save_config(cfg); engine.register_all(); refresh()   # re-arm: the sent key changed
+        linked = cfg["bindings"].get(keynum)
+        if linked:
+            set_status(f"{KEY_LABELS[keynum]} now sends {text} -> the app runs '{linked}' on it")
+        else:
+            set_status(f"{KEY_LABELS[keynum]} now sends {text} (works on any PC, no app needed)")
 
     def rename_macro():
         old = selected_macro()
@@ -1647,25 +1680,30 @@ def run_gui(cfg, engine):
         root.after(2000, lambda: engine._run(name))
 
     def bind():
+        """Map Macro (layer 2): link a recorded macro to a key.
+
+        The app plays it when it detects whatever the key *sends* (layer 1). If the key has no
+        'sends' yet, give it its default trigger (F13..F21) and program that onto the device so
+        the link works immediately; if it already sends something (set via Bind to key), we
+        just listen for that instead - the two layers coexist."""
         name = selected_macro(); keynum = selected_keynum()
         if not name or not keynum:
             set_status("Select a macro AND a key"); return
         cfg["bindings"][keynum] = name
-        cfg["shortcuts"].pop(keynum, None)    # a key sends one thing: drop any native combo
+        trigger = cfg["shortcuts"].get(keynum)
+        if not trigger:                       # give it the default trigger and program the pad
+            trigger = chord_macropad_token(keynum)      # F13..F21 for this key
+            try:
+                program_key_on_device(keynum)
+                cfg["shortcuts"][keynum] = trigger
+                record_in_layout(keynum, name)
+            except Exception as e:
+                save_config(cfg); engine.register_all(); refresh()
+                set_status(f"Linked '{name}' to {KEY_LABELS[keynum]}, but couldn't program the"
+                           f" pad ({e}) - plug it in and run Map Macro again")
+                return
         save_config(cfg); engine.register_all(); refresh()
-        # Binding is only half the job: the listener above waits for the chord, but the
-        # physical key sends nothing until the device is programmed to emit it. Doing both
-        # here is what makes "Bind" mean what the user expects.
-        try:
-            program_key_on_device(keynum)
-        except Exception as e:
-            set_status(f"Bound '{name}' to {KEY_LABELS[keynum]}, but the macropad could not"
-                       f" be programmed ({e}) - plug it in and use 'Program Key on Device'")
-            return
-        # only now is the device's real state known, so record it
-        note = record_in_layout(keynum, name)
-        set_status(f"Bound '{name}' to {KEY_LABELS[keynum]}, programmed it to send"
-                   f" {chord_macropad_token(keynum)} - {note}")
+        set_status(f"{KEY_LABELS[keynum]} sends {trigger} -> runs '{name}' while the app is open")
 
     def unbind():
         keynum = selected_keynum()
@@ -1690,56 +1728,6 @@ def run_gui(cfg, engine):
         else:
             set_status(f"Unbound {KEY_LABELS[keynum]}"
                        f" (key still sends {chord_macropad_token(keynum)})")
-
-    def program_key():
-        keynum = selected_keynum()
-        if not keynum:
-            set_status("Select a key first"); return
-        try:
-            program_key_on_device(keynum)
-            note = record_in_layout(keynum, cfg["bindings"].get(keynum, "(unbound)"))
-            set_status(f"Programmed {KEY_LABELS[keynum]} to send"
-                       f" {chord_macropad_token(keynum)} - {note}")
-        except Exception as e:
-            messagebox.showerror("Device error",
-                                 f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
-
-    def send_to_device():
-        """Burn the selected macro onto the selected key as native firmware keystrokes.
-
-        This is the one way a bind travels *with the device*: the key then types the chords
-        directly on any PC, no app running. It's mutually exclusive with a Macro Studio
-        trigger (a key sends one thing), so it drops the app-side binding for that key."""
-        name = selected_macro(); keynum = selected_keynum()
-        if not name or not keynum:
-            set_status("Select a macro AND a key"); return
-        strokes = macro_as_keystrokes(cfg["macros"][name])
-        if not strokes:
-            set_status(f"'{name}' is too complex for the device "
-                       "(needs <=5 keystrokes, no mouse, no app)"); return
-        human = keystrokes_text(strokes)
-        if not messagebox.askyesno(
-                "Send to device",
-                f"Program {KEY_LABELS[keynum]} to type\n\n    {human}\n\n"
-                "directly onto the macropad's flash?\n\n"
-                "• Works on ANY PC with no app running, and travels with the device.\n"
-                f"• {KEY_LABELS[keynum]} will no longer trigger '{name}' through Macro "
-                "Studio (so no timing or app focus).\n\nContinue?"):
-            return
-        try:
-            import macropad as m
-            with m.Macropad() as mp:
-                mp.set_keyboard(int(keynum), strokes)
-        except Exception as e:
-            messagebox.showerror("Device error",
-                                 f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
-            return
-        _replace_layout_line(keynum, {"type": "key", "keys": human,
-                                      "note": f"On-device: {name}"})
-        cfg["bindings"].pop(keynum, None)     # no longer a chord trigger; it's native now
-        cfg["shortcuts"][keynum] = human      # show it as an on-device combo in the key pane
-        save_config(cfg); engine.register_all(); refresh()
-        set_status(f"Sent '{name}' to {KEY_LABELS[keynum]} - it now types {human} on any PC")
 
     def export_binds():
         if not cfg["macros"]:
@@ -1772,18 +1760,15 @@ def run_gui(cfg, engine):
         if clash and not messagebox.askyesno(
                 "Import binds",
                 f"Import {len(macros)} macro(s)?\n\n{len(clash)} will overwrite macros of the "
-                "same name here.\n\nThe device is not reprogrammed - use 'Program key' (chord "
-                "binds) or 'Assign shortcut' (native combos) afterwards to arm the keys here."):
+                "same name here.\n\nThe device is not reprogrammed - run 'Map Macro' (chord "
+                "binds) or 'Bind to key' (native combos) afterwards to arm the keys here."):
             return
         cfg["macros"].update(macros)
         cfg["bindings"].update(bindings)
-        cfg["shortcuts"].update(shortcuts)
-        # a key can't be both: an imported native shortcut wins over a stale chord binding
-        for k in shortcuts:
-            cfg["bindings"].pop(k, None)
+        cfg["shortcuts"].update(shortcuts)   # the two layers coexist per key
         save_config(cfg); engine.register_all(); refresh()
         set_status(f"Imported {len(macros)} macro(s), {len(shortcuts)} shortcut(s) - "
-                   "arm the device with 'Program key' / 'Assign shortcut'")
+                   "arm the device with 'Map Macro' / 'Bind to key'")
 
     def add_button(parent, name, txt, fn, accent=False):
         b = ttk.Button(parent, text=txt, command=fn,
@@ -1808,11 +1793,9 @@ def run_gui(cfg, engine):
     add_button(macro_bar, "set_app", "Set app…", set_app)
     add_button(macro_bar, "test", "Test", test_macro)
     add_button(macro_bar, "delete", "Delete", delete_macro)
-    add_button(key_bar, "bind", "Bind to key", bind)
+    add_button(key_bar, "bind", "Map Macro", bind)
+    add_button(key_bar, "assign_shortcut", "Bind to key", assign_shortcut)
     add_button(key_bar, "unbind", "Unbind", unbind)
-    add_button(key_bar, "program", "Program key", program_key)
-    add_button(key_bar2, "assign_shortcut", "Assign shortcut", assign_shortcut, accent=True)
-    add_button(key_bar2, "send_dev", "Send to device", send_to_device)
 
     # keep buttons in step with the selection, and offer the native direct interactions
     macro_list.bind("<<TreeviewSelect>>", update_states)
@@ -1825,6 +1808,14 @@ def run_gui(cfg, engine):
     key_list.bind("<Delete>", lambda e: unbind())
 
     refresh()
+
+    # Clamp the minimum window size to what the fully-built layout actually needs, so no edge
+    # drag can hide a button. reqwidth/reqheight reflect every packed child at this point; a
+    # small margin absorbs title-bar/scrollbar rounding.
+    def set_min_size():
+        root.update_idletasks()
+        root.minsize(root.winfo_reqwidth() + 8, root.winfo_reqheight() + 8)
+    set_min_size()
 
     # --- tray ---
     def start_tray():
