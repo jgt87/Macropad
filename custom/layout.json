@@ -11,6 +11,6 @@
 
     "13": { "type": "media", "name": "voldown",  "note": "knob turn left  = Volume Down" },
     "14": { "type": "key",   "keys": "alt+tab",  "note": "knob press      = Alt+Tab (switch window)" },
-    "15": { "type": "media", "name": "volup",    "note": "knob turn right = Volume Up" }
+    "15": { "type": "key", "keys": "f21", "note": "Macro Studio: Calculator" }
   }
 }

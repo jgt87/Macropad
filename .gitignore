@@ -24,4 +24,7 @@ custom/decompiled/
 
 # PyInstaller build output
 custom/build/
-custom/dist/
+# Ignore everything in dist EXCEPT the published portable executable. The state files
+# beside it (macros.json / layout.json) are machine-local and must stay untracked.
+custom/dist/*
+!custom/dist/MacroStudio.exe

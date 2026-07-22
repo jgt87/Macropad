@@ -108,6 +108,7 @@ def load_config():
     cfg.setdefault("macros", {})      # name -> {"events": [...], "app": ""}
     cfg.setdefault("bindings", {})    # keynum -> macro name the app runs (layer 2)
     cfg.setdefault("shortcuts", {})   # keynum -> what the key sends, e.g. "f13" / "ctrl+c" (layer 1)
+    cfg.setdefault("ui", {})          # window prefs, e.g. {"sash": 0.5} = divider position
     # Migration: before the two layers were split, a mapped macro triggered on the fixed
     # CHORDS[keynum]. Record that as the key's "sends" so those binds keep firing.
     for keynum in cfg["bindings"]:
@@ -261,6 +262,40 @@ def import_bundle(path):
             and isinstance(shortcuts, dict)):
         raise ValueError("not a Macro Studio binds file")
     return macros, bindings, shortcuts
+
+
+def auto_import_folder(cfg):
+    """Merge any Macro Studio bind bundles sitting in the app folder into cfg.
+
+    So dropping an exported .json next to the .exe loads it on the next launch without a
+    manual Import. Fill-only: existing macros/bindings/shortcuts are never overwritten, so
+    it's idempotent across restarts and can't revert edits made in the app. The live config
+    (macros.json) and the differently-shaped layout/default files are skipped. Returns the
+    number of macros newly added."""
+    skip = {os.path.basename(CONFIG_PATH).lower(), "layout.json", "default-config.json"}
+    try:
+        names = sorted(os.listdir(HERE))
+    except OSError:
+        return 0
+    added = 0
+    for name in names:
+        if not name.lower().endswith(".json") or name.lower() in skip:
+            continue
+        try:
+            macros, bindings, shortcuts = import_bundle(os.path.join(HERE, name))
+        except Exception:
+            continue                       # not a binds bundle - ignore quietly
+        for mname, macro in macros.items():
+            if mname not in cfg["macros"]:
+                cfg["macros"][mname] = macro
+                added += 1
+        for k, v in bindings.items():
+            cfg["bindings"].setdefault(k, v)
+        for k, v in shortcuts.items():
+            cfg["shortcuts"].setdefault(k, v)   # the two layers coexist per key
+    if added:
+        save_config(cfg)
+    return added
 
 
 # keyboard-library event names -> the tokens macropad.py understands. Only the spellings that
@@ -1349,25 +1384,92 @@ def run_gui(cfg, engine):
 
     panes = ttk.Frame(root, padding=(20, 0, 20, 16))
     panes.pack(side="top", fill="both", expand=True)
-    panes.columnconfigure(0, weight=1, uniform="pane")
-    panes.columnconfigure(1, weight=1, uniform="pane")
-    panes.rowconfigure(1, weight=1)
 
-    ttk.Label(panes, text="Macros").grid(row=0, column=0, sticky="w", pady=(0, 6))
-    ttk.Label(panes, text="Macropad keys").grid(
-        row=0, column=1, sticky="w", padx=(16, 0), pady=(0, 6))
+    # Two side-by-side columns whose split the user can drag. A classic tk.PanedWindow
+    # (not the fixed 50/50 grid we used to use, nor ttk's Panedwindow) is chosen because it
+    # lets us blend the sash into the window bg and paint our own grip (two short vertical
+    # lines) over its centre — see the grip Canvas below.
+    # The per-side padding + sashwidth together reproduce the old ~16px gutter between panes.
+    SASHW = 8   # grab width; the sash itself blends into the bg, the grip is the visual
+    pw = tk.PanedWindow(panes, orient="horizontal", background=p["bg"],
+                        sashwidth=SASHW, sashrelief="flat", bd=0, sashpad=0,
+                        opaqueresize=True)
+    pw.pack(fill="both", expand=True)
 
-    macro_card, macro_list = make_table(panes, ("Name", "Application"), (170, 150))
+    left_pane = ttk.Frame(pw, padding=(0, 0, 6, 0))
+    left_pane.columnconfigure(0, weight=1)
+    left_pane.rowconfigure(1, weight=1)
+    right_pane = ttk.Frame(pw, padding=(6, 0, 0, 0))
+    right_pane.columnconfigure(0, weight=1)
+    right_pane.rowconfigure(1, weight=1)
+    pw.add(left_pane, minsize=240, stretch="always")
+    pw.add(right_pane, minsize=240, stretch="always")
+
+    ttk.Label(left_pane, text="Macros").grid(row=0, column=0, sticky="w", pady=(0, 6))
+    ttk.Label(right_pane, text="Macropad keys").grid(
+        row=0, column=0, sticky="w", pady=(0, 6))
+
+    macro_card, macro_list = make_table(left_pane, ("Name", "Application"), (170, 150))
     macro_card.grid(row=1, column=0, sticky="nsew")
-    key_card, key_list = make_table(panes, ("Key", "Sends", "Runs macro"), (120, 100, 140))
-    key_card.grid(row=1, column=1, sticky="nsew", padx=(16, 0))
+    key_card, key_list = make_table(
+        right_pane, ("Key", "Sends", "Runs macro"), (120, 100, 140))
+    key_card.grid(row=1, column=0, sticky="nsew")
 
     # Bottom-left bar holds the global actions (Record new / Export / Import); per-macro
     # actions live on a right-click context menu. Key-pane actions sit under the key list.
-    macro_bar = ttk.Frame(panes)
+    macro_bar = ttk.Frame(left_pane)
     macro_bar.grid(row=2, column=0, sticky="w", pady=(10, 0))
-    key_bar = ttk.Frame(panes)
-    key_bar.grid(row=2, column=1, sticky="w", padx=(16, 0), pady=(10, 0))
+    key_bar = ttk.Frame(right_pane)
+    key_bar.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+    # The divider's visual: two short vertical lines drawn on a small Canvas floated over the
+    # sash centre (the sash proper is invisible). The Canvas also drives dragging, so the grip
+    # is the handle rather than a thin strip the user has to hunt for.
+    GRIP_W, GRIP_H, GAP = 11, 30, 4     # canvas size and spacing between the two lines
+    grip = tk.Canvas(pw, width=GRIP_W, height=GRIP_H, bg=p["bg"],
+                     highlightthickness=0, cursor="sb_h_double_arrow", takefocus=0)
+    for lx in (GRIP_W // 2 - GAP // 2, GRIP_W // 2 + GAP // 2):
+        grip.create_line(lx, 4, lx, GRIP_H - 4, fill=p["btn"], width=2)   # button-body grey
+
+    def _position_grip(_event=None):
+        if pw.winfo_width() <= 1:
+            return
+        try:
+            sx = pw.sash_coord(0)[0]
+        except Exception:
+            return
+        grip.place(x=sx + SASHW // 2 - GRIP_W // 2,
+                   y=max(0, (pw.winfo_height() - GRIP_H) // 2))
+
+    # Divider position is remembered as a fraction of the pane width (0..1) in cfg["ui"],
+    # so it's independent of window size. Place it once the panes have a real width — the
+    # two tables request different widths, so left to itself the initial split isn't 50/50.
+    def _place_sash():
+        total = pw.winfo_width()
+        if total > 1:
+            frac = min(0.85, max(0.15, float(cfg["ui"].get("sash", 0.5))))
+            pw.sash_place(0, int(total * frac), 0)
+        _position_grip()
+    pw.after(80, _place_sash)
+
+    def _drag_grip(_event=None):
+        x = pw.winfo_pointerx() - pw.winfo_rootx()
+        x = max(1, min(pw.winfo_width() - 1, x))
+        pw.sash_place(0, x, 0)
+        _position_grip()
+
+    def _save_sash(_event=None):
+        total = pw.winfo_width()
+        if total > 1:
+            frac = round(pw.sash_coord(0)[0] / total, 4)
+            if frac != cfg["ui"].get("sash"):
+                cfg["ui"]["sash"] = frac
+                save_config(cfg)
+
+    grip.bind("<B1-Motion>", _drag_grip)          # drag the grip to move the divider
+    grip.bind("<ButtonRelease-1>", _save_sash)    # persist once the drag ends
+    pw.bind("<ButtonRelease-1>", _save_sash)      # also persist a drag of the bare sash
+    pw.bind("<Configure>", _position_grip)        # keep the grip centred on window resize
 
     def set_status(msg):
         status.config(text=msg)
@@ -1851,7 +1953,7 @@ def run_gui(cfg, engine):
 
     # macro-pane actions, then key-pane actions - each under the list it operates on
     add_button(key_bar, "bind", "Map Macro", bind)
-    add_button(key_bar, "assign_shortcut", "Bind to key", assign_shortcut)
+    add_button(key_bar, "assign_shortcut", "Bind to Key (combination)", assign_shortcut)
     add_button(key_bar, "unbind", "Unbind", unbind)
 
     # macro actions live on a right-click menu instead of a button bar. tk.Menu is the dated
@@ -2030,11 +2132,13 @@ def main():
         return
     _seed_data_files()
     cfg = load_config()
+    imported = auto_import_folder(cfg)   # pick up any bundle .json dropped in the app folder
     engine = Engine(cfg)
     engine.register_all()
 
     if "--selftest" in sys.argv:
         print("config:", CONFIG_PATH)
+        print("auto-imported macros:", imported)
         print("macros:", list(cfg["macros"]))
         print("bindings:", cfg["bindings"])
         print("registered hotkeys:", list(engine._registered))
