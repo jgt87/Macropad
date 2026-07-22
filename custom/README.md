@@ -102,7 +102,7 @@ with Macropad() as mp:
 ## Macro Studio (main app) — record, bind, and run macros
 
 `macro_studio.py` is the primary companion app: a system-tray program to **record**
-keystroke macros, **bind** them to macropad keys, and **run** them — with optional
+keystroke and mouse macros, **bind** them to macropad keys, and **run** them — with optional
 application context (launch/focus an app first). This gets past the 5-keystroke limit and
 lets one key do long/app-aware actions.
 
@@ -118,7 +118,7 @@ How it works — **two independent layers per key**, shown as the *Sends* and *R
 - **Run it, either way:**
   - **Packaged (no Python):** grab `MacroStudio.exe` (from a release, or build it — see below)
     and double-click it. It's a single portable file; its `macros.json` config lives next to it.
-  - **From source:** `pip install hidapi keyboard pystray Pillow`, then `pythonw macro_studio.py`
+  - **From source:** `pip install hidapi keyboard mouse pystray Pillow`, then `pythonw macro_studio.py`
     (auto-starts via a Startup-folder shortcut).
 - **Workflow:** Record New → select the macro + a key → **Map Macro**. That auto-assigns the key
   its default trigger (`F13`–`F21`) and programs the pad, then links the macro. Press the key to
@@ -130,8 +130,10 @@ How it works — **two independent layers per key**, shown as the *Sends* and *R
   typing. If the app can't be started the macro is skipped rather than typed into whatever
   happened to be focused. **Set App…** overrides the detection by hand.
 - **Config:** `macros.json`. **Smoke-test:** `python macro_studio.py --selftest`.
-- Notes: keystroke macros only (no mouse); global hooks may need the app run as admin to
-  catch every key.
+- Notes: records keystrokes plus mouse clicks and wheel ticks (each click stores its own
+  position; raw pointer movement isn't recorded). Mouse capture needs the `mouse` package —
+  without it, recording falls back to keystroke-only. Global hooks may need the app run as
+  admin to catch every key.
 
 ## Bind a key to a keyboard combination
 

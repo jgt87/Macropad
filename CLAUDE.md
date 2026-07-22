@@ -20,7 +20,7 @@ All commands run from `custom/`. There is no automated test suite.
 
 ```bash
 pip install hidapi                              # macropad.py
-pip install hidapi keyboard pystray Pillow      # macro_studio.py
+pip install hidapi keyboard mouse pystray Pillow  # macro_studio.py
 
 python macropad.py list                         # read-only: confirm device + config interface
 python macropad.py key 1 ctrl+c                 # assign a key
