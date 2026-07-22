@@ -113,3 +113,24 @@ def test_describe_event():
     assert "ctrl" in keyboard_label and "down" in keyboard_label
     assert ms.describe_event({"src": "m", "e": "wheel", "d": 1})
     assert ms.describe_event({"src": "m", "e": "up", "b": "right"})
+
+
+def test_save_config_preserves_profile_apps(tmp_path):
+    old_config = ms.CONFIG_PATH
+    try:
+        path = tmp_path / "macros.json"
+        ms.CONFIG_PATH = str(path)
+        cfg = {
+            "macros": {}, "bindings": {"1": "Copy"}, "shortcuts": {"1": "f13"},
+            "ui": {},
+            "active_profile": "Coding",
+            "profiles": {"Coding": {"bindings": {"1": "Copy"}, "shortcuts": {"1": "f13"},
+                                    "apps": ["code.exe"]}},
+        }
+        ms.save_config(cfg, backup=False)   # backup=False: don't touch the real backups dir
+        reloaded = json.load(open(path, encoding="utf-8"))
+        # the app-binding survives the active-profile sync, and live binds are folded in
+        assert reloaded["profiles"]["Coding"]["apps"] == ["code.exe"]
+        assert reloaded["profiles"]["Coding"]["bindings"] == {"1": "Copy"}
+    finally:
+        ms.CONFIG_PATH = old_config

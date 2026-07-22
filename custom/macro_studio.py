@@ -190,13 +190,18 @@ def _backup_config():
         pass
 
 
-def save_config(cfg):
-    _backup_config()
-    if (isinstance(cfg.get("profiles"), dict)
-            and cfg.get("active_profile") in cfg["profiles"]):
-        cfg["profiles"][cfg["active_profile"]] = {
-            "bindings": dict(cfg.get("bindings", {})),
-            "shortcuts": dict(cfg.get("shortcuts", {}))}
+def save_config(cfg, backup=True):
+    # backup=False is for high-frequency writes (auto profile switching) that shouldn't churn
+    # the rolling backup ring on every focus change.
+    if backup:
+        _backup_config()
+    active = cfg.get("active_profile")
+    if isinstance(cfg.get("profiles"), dict) and active in cfg["profiles"]:
+        # Sync the live binds into the active profile IN PLACE, so extra per-profile keys
+        # (e.g. "apps" for app-bound auto-switching) survive the sync instead of being dropped.
+        prof = cfg["profiles"][active]
+        prof["bindings"] = dict(cfg.get("bindings", {}))
+        prof["shortcuts"] = dict(cfg.get("shortcuts", {}))
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -2200,9 +2205,13 @@ def run_gui(cfg, engine):
     def export_binds():
         if not cfg["macros"]:
             set_status("No macros to export yet"); return
+        # Default name carries app + active profile + date, e.g. Macropad-VS Code-20260722.json
+        # (strip only characters Windows forbids in a filename; a space like "VS Code" is fine).
+        profile = re.sub(r'[\\/:*?"<>|]', "", cfg.get("active_profile", "Default")).strip()
+        default_name = f"Macropad-{profile or 'Default'}-{time.strftime('%Y%m%d')}.json"
         path = filedialog.asksaveasfilename(
             parent=root, title="Export binds", defaultextension=".json",
-            initialfile="macro-studio-binds.json",
+            initialfile=default_name,
             filetypes=[("Macro Studio binds", "*.json"), ("All files", "*.*")])
         if not path:
             return
@@ -2332,28 +2341,107 @@ def run_gui(cfg, engine):
         win.focus_force()
         win.grab_set()
 
-    def switch_profile(target):
-        if target == cfg.get("active_profile"):
-            return
-        if target not in cfg["profiles"]:
-            return
+    def _persist_active():
+        """Fold the live binds back into the active profile (in place, keeping "apps")."""
         cur = cfg.get("active_profile", "Default")
-        cfg["profiles"][cur] = {
-            "bindings": dict(cfg.get("bindings", {})),
-            "shortcuts": dict(cfg.get("shortcuts", {}))}
+        prof = cfg["profiles"].setdefault(cur, {})
+        prof["bindings"] = dict(cfg.get("bindings", {}))
+        prof["shortcuts"] = dict(cfg.get("shortcuts", {}))
+
+    def _apply_profile(target, backup=True):
+        """Swap the app-side layer to `target` and re-arm hotkeys. No device write, no prompt -
+        so it's safe to call on every focus change. Returns True if it actually switched."""
+        if target == cfg.get("active_profile") or target not in cfg["profiles"]:
+            return False
+        _persist_active()
         prof = cfg["profiles"][target]
         cfg["bindings"] = dict(prof.get("bindings", {}))
         cfg["shortcuts"] = dict(prof.get("shortcuts", {}))
         cfg["active_profile"] = target
-        save_config(cfg)
+        save_config(cfg, backup=backup)
         engine.register_all()
         refresh()
+        return True
+
+    def switch_profile(target):
+        if not _apply_profile(target):
+            return
+        # A manual switch offers to reprogram flash (auto-switch never does - see _auto_tick).
         if cfg["shortcuts"] and messagebox.askyesno(
                 "Switch profile",
                 f"Switched to '{target}'.\n\nReprogram the device to match this profile now?"):
             reprogram_device()
         else:
             set_status(f"Active profile: {target}")
+
+    # --- app-bound profile auto-switching -----------------------------------------------
+    # The device sends the same triggers (F13..F21) under every profile, so following the
+    # foreground app only means swapping the app-side macro bindings (_apply_profile) - never
+    # a flash write. A light poll tracks the last real foreground app; when auto-switch is on
+    # it activates the matching profile, or the fallback when nothing matches.
+    last_fg = {"exe": ""}
+
+    def _profile_for_exe(exe):
+        for pname, prof in cfg.get("profiles", {}).items():
+            if exe in [a.lower() for a in prof.get("apps", [])]:
+                return pname
+        fb = cfg.get("ui", {}).get("fallback_profile", "Default")
+        return fb if fb in cfg.get("profiles", {}) else None
+
+    def _auto_tick():
+        try:
+            # pause while recording or any modal dialog is up, so we never re-arm mid-capture
+            if recording.get("hook") is None and root.grab_current() is None:
+                _pid, path = foreground_app()
+                exe = os.path.basename(path).lower() if path else ""
+                if exe:                                   # ignore our own window / shell (=> "")
+                    last_fg["exe"] = exe
+                    if cfg.get("ui", {}).get("auto_profile"):
+                        target = _profile_for_exe(exe)
+                        if target and target != cfg.get("active_profile"):
+                            if _apply_profile(target, backup=False):
+                                set_status(f"Auto-switched to '{target}' for {exe}")
+        except Exception:
+            pass
+        finally:
+            root.after(700, _auto_tick)
+
+    def toggle_auto_profile():
+        ui = cfg.setdefault("ui", {})
+        ui["auto_profile"] = not ui.get("auto_profile", False)
+        save_config(cfg)
+        if ui["auto_profile"]:
+            set_status("Auto-switch by app: ON - it follows the foreground app")
+            _auto_tick()                                  # act at once, don't wait a tick
+        else:
+            set_status("Auto-switch by app: off")
+
+    def assign_app_to_profile():
+        exe = last_fg["exe"]
+        if not exe:
+            set_status("Focus the target app once, then assign it"); return
+        active = cfg.get("active_profile", "Default")
+        cfg["profiles"][active].setdefault("apps", [])
+        if exe not in cfg["profiles"][active]["apps"]:
+            cfg["profiles"][active]["apps"].append(exe)
+        for pn, pr in cfg["profiles"].items():            # an app maps to one profile only
+            if pn != active and exe in pr.get("apps", []):
+                pr["apps"].remove(exe)
+        save_config(cfg); refresh()
+        set_status(f"'{active}' now activates for {exe}")
+
+    def clear_app_assignment():
+        active = cfg.get("active_profile", "Default")
+        if cfg["profiles"].get(active, {}).get("apps"):
+            cfg["profiles"][active]["apps"] = []
+            save_config(cfg); refresh()
+            set_status(f"Cleared app assignment for '{active}'")
+
+    def set_fallback_profile():
+        active = cfg.get("active_profile", "Default")
+        cfg.setdefault("ui", {})["fallback_profile"] = active
+        save_config(cfg)
+        set_status(f"'{active}' is now the auto-switch fallback")
 
     def new_profile():
         name = ask_string("New profile", "Name for the new profile:")
@@ -2406,8 +2494,28 @@ def run_gui(cfg, engine):
         set_status(f"Deleted profile; active: {name}")
 
     def open_profile_menu():
-        items = [(pname, lambda n=pname: switch_profile(n))
-                 for pname in sorted(cfg["profiles"])]
+        active = cfg.get("active_profile")
+        fallback = cfg.get("ui", {}).get("fallback_profile", "Default")
+        auto_on = bool(cfg.get("ui", {}).get("auto_profile"))
+        items = []
+        for pname in sorted(cfg["profiles"]):
+            apps = cfg["profiles"][pname].get("apps", [])
+            extra = []
+            if apps:
+                extra.append(", ".join(apps))
+            if pname == fallback:
+                extra.append("fallback")
+            label = ("✓ " if pname == active else "  ") + pname
+            if extra:
+                label += "  — " + " · ".join(extra)
+            items.append((label, lambda n=pname: switch_profile(n)))
+        items.append(None)
+        items.append((("✓ " if auto_on else "  ") + "Auto-switch by app", toggle_auto_profile))
+        items.append((f"Assign current app → '{active}'", assign_app_to_profile))
+        if cfg["profiles"].get(active, {}).get("apps"):
+            items.append((f"Clear app assignment for '{active}'", clear_app_assignment))
+        if active != fallback:
+            items.append((f"Set '{active}' as fallback", set_fallback_profile))
         items.extend([None, ("New profile…", new_profile),
                       ("Rename profile…", rename_profile),
                       ("Delete profile", delete_profile)])
@@ -2415,6 +2523,7 @@ def run_gui(cfg, engine):
                         profile_btn.winfo_rooty() + profile_btn.winfo_height())
 
     profile_btn.config(command=open_profile_menu)
+    root.after(1200, _auto_tick)   # start the foreground poll (tracks last app; auto-switches)
 
     def open_led_menu():
         # tick the mode last set from here (cfg["ui"]["led"]); a 2-char prefix slot keeps the
