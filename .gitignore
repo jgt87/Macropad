@@ -22,9 +22,7 @@ en-US/
 zh-CN/
 custom/decompiled/
 
-# PyInstaller build output
+# PyInstaller build output. The portable executable is distributed via GitHub Releases
+# (pushed by the v* release workflow), not committed here.
 custom/build/
-# Ignore everything in dist EXCEPT the published portable executable. The state files
-# beside it (macros.json / layout.json) are machine-local and must stay untracked.
-custom/dist/*
-!custom/dist/MacroStudio.exe
+custom/dist/
