@@ -129,6 +129,10 @@ How it works — **two independent layers per key**, shown as the *Sends* and *R
   **starts it if it isn't running**, waiting for its window to appear (up to 30s) before
   typing. If the app can't be started the macro is skipped rather than typed into whatever
   happened to be focused. **Set App…** overrides the detection by hand.
+  - *Heads up:* the click you use to focus that app is itself recorded (only clicks on Macro
+    Studio's own windows are dropped), so it replays too. It's usually harmless since the app
+    is focused first anyway, but for the cleanest macro, focus the app **before** hitting
+    Record and record only the actions themselves.
 - **Config:** `macros.json`. **Smoke-test:** `python macro_studio.py --selftest`.
 - Notes: records keystrokes plus mouse clicks and wheel ticks (each click stores its own
   position; raw pointer movement isn't recorded). Mouse capture needs the `mouse` package —
