@@ -26,3 +26,6 @@ custom/decompiled/
 # (pushed by the v* release workflow), not committed here.
 custom/build/
 custom/dist/
+
+# Local screenshot / scratch dropbox next to the app
+custom/temp/

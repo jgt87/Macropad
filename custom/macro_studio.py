@@ -55,7 +55,16 @@ HERE = _base_dir()
 BUNDLE_DIR = _bundle_dir()
 sys.path.insert(0, HERE)
 sys.path.insert(0, BUNDLE_DIR)
-CONFIG_PATH = os.path.join(HERE, "macros.json")
+if getattr(sys, "frozen", False):
+    STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or HERE, "MacroStudio")
+else:
+    STATE_DIR = HERE
+try:
+    os.makedirs(STATE_DIR, exist_ok=True)
+except Exception:
+    pass
+CONFIG_PATH = os.path.join(STATE_DIR, "macros.json")
+BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 LAYOUT_PATH = os.path.join(HERE, "layout.json")
 
 try:
@@ -96,6 +105,17 @@ def chord_macropad_token(keynum):
 
 
 # ---------------------------------------------------------------- config
+def _migrate_state_dir():
+    """Move a frozen build's legacy beside-exe config into its writable state folder."""
+    old_path = os.path.join(HERE, "macros.json")
+    if (getattr(sys, "frozen", False) and not os.path.exists(CONFIG_PATH)
+            and os.path.exists(old_path)):
+        try:
+            shutil.copyfile(old_path, CONFIG_PATH)
+        except Exception:
+            pass
+
+
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
@@ -115,6 +135,27 @@ def load_config():
         if keynum in CHORDS:
             cfg["shortcuts"].setdefault(keynum, CHORDS[keynum])
     _migrate_macros(cfg)
+    if "profiles" not in cfg:
+        cfg["profiles"] = {
+            "Default": {"bindings": dict(cfg["bindings"]),
+                        "shortcuts": dict(cfg["shortcuts"])}}
+        cfg["active_profile"] = "Default"
+    if not isinstance(cfg.get("profiles"), dict):
+        cfg["profiles"] = {}
+    cfg.setdefault("active_profile", "Default")
+    active = cfg["active_profile"]
+    if active not in cfg["profiles"]:
+        cfg["profiles"][active] = {
+            "bindings": dict(cfg.get("bindings", {})),
+            "shortcuts": dict(cfg.get("shortcuts", {}))}
+    for pname, profile in list(cfg["profiles"].items()):
+        if not isinstance(profile, dict):
+            profile = {}
+            cfg["profiles"][pname] = profile
+        if not isinstance(profile.get("bindings"), dict):
+            profile["bindings"] = {}
+        if not isinstance(profile.get("shortcuts"), dict):
+            profile["shortcuts"] = {}
     return cfg
 
 
@@ -132,7 +173,30 @@ def _migrate_macros(cfg):
         macro.setdefault("app_exe", "")
 
 
+def _backup_config():
+    """Keep the ten newest timestamped copies of the current config, best-effort."""
+    try:
+        if not os.path.exists(CONFIG_PATH):
+            return
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        name = "macros-%s.json" % time.strftime("%Y%m%d-%H%M%S")
+        shutil.copyfile(CONFIG_PATH, os.path.join(BACKUP_DIR, name))
+        backups = sorted(
+            name for name in os.listdir(BACKUP_DIR)
+            if name.startswith("macros-") and name.endswith(".json"))
+        for old in backups[:-10]:
+            os.remove(os.path.join(BACKUP_DIR, old))
+    except Exception:
+        pass
+
+
 def save_config(cfg):
+    _backup_config()
+    if (isinstance(cfg.get("profiles"), dict)
+            and cfg.get("active_profile") in cfg["profiles"]):
+        cfg["profiles"][cfg["active_profile"]] = {
+            "bindings": dict(cfg.get("bindings", {})),
+            "shortcuts": dict(cfg.get("shortcuts", {}))}
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
@@ -864,6 +928,15 @@ def serialize_events(key_events, mouse_events=()):
     return out
 
 
+def describe_event(ev):
+    """Return a compact label for a recorded keyboard or mouse event."""
+    if ev.get("src") == "k":
+        return f"{ev.get('n', '?')} {ev.get('e')}"
+    if ev.get("e") == "wheel":
+        return f"wheel {ev.get('d')}"
+    return f"mouse {ev.get('b', 'left')} {ev.get('e')}"
+
+
 CLICK_MARGIN = 8   # px of slack around the target window when validating a click
 
 
@@ -1374,6 +1447,16 @@ def run_gui(cfg, engine):
     ttk.Label(htext, text="Macro Studio", style="Title.TLabel").pack(anchor="w")
     ttk.Label(htext, text="Record a macro, then bind it to a key on the macropad.",
               style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+    profile_btn = ttk.Button(header, text="Profile: …  ▾")
+    profile_btn.pack(side="right")
+    # LED backlight dropdown, sitting just left of the profile picker (packed right after it)
+    led_btn = ttk.Button(header, text="Test LED Modi  ▾")
+    led_btn.pack(side="right", padx=(0, 8))
+
+    def refresh_profile_btn():
+        profile_btn.config(text=f"Profile: {cfg.get('active_profile', 'Default')}  ▾")
+
+    refresh_profile_btn()
 
     btns = {}   # action-name -> ttk.Button, so selection can enable/disable them
 
@@ -1404,6 +1487,10 @@ def run_gui(cfg, engine):
     right_pane.rowconfigure(1, weight=1)
     pw.add(left_pane, minsize=240, stretch="always")
     pw.add(right_pane, minsize=240, stretch="always")
+    # Real per-pane minimums, filled in by set_min_size() once the button bars are built, so
+    # the sash can never be dragged narrow enough to clip a button. Read back when placing the
+    # sash so a restored split can't violate them either.
+    pane_min = {"l": 240, "r": 240}
 
     ttk.Label(left_pane, text="Macros").grid(row=0, column=0, sticky="w", pady=(0, 6))
     ttk.Label(right_pane, text="Macropad keys").grid(
@@ -1412,7 +1499,7 @@ def run_gui(cfg, engine):
     macro_card, macro_list = make_table(left_pane, ("Name", "Application"), (170, 150))
     macro_card.grid(row=1, column=0, sticky="nsew")
     key_card, key_list = make_table(
-        right_pane, ("Key", "Sends", "Runs macro"), (120, 100, 140))
+        right_pane, ("Key", "Sends", "Runs macro", "Status"), (110, 90, 130, 110))
     key_card.grid(row=1, column=0, sticky="nsew")
 
     # Bottom-left bar holds the global actions (Record new / Export / Import); per-macro
@@ -1448,7 +1535,11 @@ def run_gui(cfg, engine):
         total = pw.winfo_width()
         if total > 1:
             frac = min(0.85, max(0.15, float(cfg["ui"].get("sash", 0.5))))
-            pw.sash_place(0, int(total * frac), 0)
+            x = int(total * frac)
+            lo, hi = pane_min["l"], total - pane_min["r"] - SASHW
+            if hi >= lo:                          # window wide enough to honour both minimums
+                x = max(lo, min(hi, x))
+            pw.sash_place(0, x, 0)
         _position_grip()
     pw.after(80, _place_sash)
 
@@ -1459,6 +1550,7 @@ def run_gui(cfg, engine):
         _position_grip()
 
     def _save_sash(_event=None):
+        _position_grip()                          # keep the grip on the sash after a bare drag
         total = pw.winfo_width()
         if total > 1:
             frac = round(pw.sash_coord(0)[0] / total, 4)
@@ -1469,7 +1561,12 @@ def run_gui(cfg, engine):
     grip.bind("<B1-Motion>", _drag_grip)          # drag the grip to move the divider
     grip.bind("<ButtonRelease-1>", _save_sash)    # persist once the drag ends
     pw.bind("<ButtonRelease-1>", _save_sash)      # also persist a drag of the bare sash
-    pw.bind("<Configure>", _position_grip)        # keep the grip centred on window resize
+    pw.bind("<Configure>", _position_grip)        # re-centre the grip on window resize
+    # The sash can move without pw itself resizing (a bare-sash drag just re-widths the two
+    # child panes), so track the grip off the panes' own <Configure> - that fires on every
+    # sash move, however it was triggered, keeping the grip glued to the divider.
+    left_pane.bind("<Configure>", _position_grip)
+    right_pane.bind("<Configure>", _position_grip)
 
     def set_status(msg):
         status.config(text=msg)
@@ -1515,6 +1612,30 @@ def run_gui(cfg, engine):
         win.wait_window()
         return out["v"]
 
+    def restore_backup():
+        path = filedialog.askopenfilename(
+            parent=root, title="Restore backup", initialdir=BACKUP_DIR,
+            filetypes=[("Macro Studio config", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+        except Exception as e:
+            messagebox.showerror("Restore failed", f"That backup is not valid JSON:\n{e}")
+            return
+        try:
+            shutil.copyfile(path, CONFIG_PATH)
+            new = load_config()
+        except Exception as e:
+            messagebox.showerror("Restore failed", f"Could not restore that backup:\n{e}")
+            return
+        cfg.clear()
+        cfg.update(new)
+        engine.register_all()
+        refresh()
+        set_status("Restored config from " + os.path.basename(path))
+
     # playback runs on worker threads; marshal their status back onto the tk thread
     engine.status_cb = lambda msg: root.after(0, lambda: set_status(msg))
 
@@ -1538,14 +1659,27 @@ def run_gui(cfg, engine):
             # when it detects that (app). Either, both, or neither may be set.
             sends = cfg["shortcuts"].get(keynum) or "—"
             runs = cfg["bindings"].get(keynum) or "—"
+            binding = cfg["bindings"].get(keynum)
+            shortcut = cfg["shortcuts"].get(keynum)
+            if binding and binding not in cfg["macros"]:
+                key_status = "⚠ missing macro"
+            elif binding and not shortcut:
+                key_status = "⚠ not armed"
+            elif binding and shortcut:
+                key_status = "✓ armed"
+            elif shortcut:
+                key_status = "sends only"
+            else:
+                key_status = "—"
             key_list.insert("", "end", iid=keynum,
-                            values=(KEY_LABELS[keynum], sends, runs))
+                            values=(KEY_LABELS[keynum], sends, runs, key_status))
 
         for tree, sel in ((macro_list, macro_sel), (key_list, key_sel)):
             keep = [i for i in sel if tree.exists(i)]
             if keep:
                 tree.selection_set(keep)
         update_states()
+        refresh_profile_btn()
 
     def selected_macro():
         sel = macro_list.selection()
@@ -1574,6 +1708,7 @@ def run_gui(cfg, engine):
         enable("bind", has_macro and keynum is not None)
         enable("unbind", key_used)
         enable("assign_shortcut", keynum is not None)
+        enable("reprogram", bool(cfg["shortcuts"]))
 
     # --- recording ---
     def record_new():
@@ -1671,8 +1806,22 @@ def run_gui(cfg, engine):
         def recompute():
             state["strokes"] = macro_as_keystrokes(
                 {"events": serialize_events(state["events"]), "app": ""})
-            preview.config(text=keystrokes_text(state["strokes"]) if state["strokes"]
-                           else "(press keys…)")
+            text = keystrokes_text(state["strokes"]) if state["strokes"] else "(press keys…)"
+            if not state["strokes"]:
+                try:
+                    import macropad as m
+                    key_downs = 0
+                    for event in state["events"]:
+                        name = str(getattr(event, "name", "") or "").lower()
+                        normal = _KB_MOD_ALIASES.get(name, name)
+                        if (getattr(event, "event_type", None) == "down"
+                                and normal not in m.MODIFIERS):
+                            key_downs += 1
+                    if key_downs > 5:
+                        text = "Too many keystrokes (max 5 on device)"
+                except Exception:
+                    pass
+            preview.config(text=text)
             save_btn.state(["!disabled"] if state["strokes"] else ["disabled"])
 
         def on_key(e):
@@ -1830,6 +1979,111 @@ def run_gui(cfg, engine):
         save_config(cfg); refresh()
         set_status(f"Set app context for '{name}'")
 
+    def edit_steps():
+        name = selected_macro()
+        if not name:
+            set_status("Select a macro first")
+            return
+        import copy
+        events = copy.deepcopy(cfg["macros"][name]["events"])
+        gaps = [0.0]
+        for i in range(1, len(events)):
+            gap = float(events[i].get("t", 0) or 0) - float(
+                events[i - 1].get("t", 0) or 0)
+            gaps.append(max(0.0, gap))
+
+        win = tk.Toplevel(root)
+        win.title(f"Edit steps — {name}")
+        win.transient(root)
+        win.geometry("560x420")
+        win.configure(bg=p["bg"])
+        _use_dark_titlebar(win, not _system_uses_light_theme())
+        frame = ttk.Frame(win, padding=20)
+        frame.pack(fill="both", expand=True)
+        card, tree = make_table(frame, ("#", "Event", "Delay (s)"), (50, 240, 90))
+        card.pack(fill="both", expand=True)
+
+        def rebuild_times():
+            elapsed = 0.0
+            for i, ev in enumerate(events):
+                gaps[i] = max(0.0, float(gaps[i]))
+                elapsed += gaps[i]
+                ev["t"] = elapsed
+
+        def redraw(select=None):
+            tree.delete(*tree.get_children())
+            for i, ev in enumerate(events):
+                tree.insert("", "end", iid=str(i),
+                            values=(i + 1, describe_event(ev), f"{round(gaps[i], 3):.3f}"))
+            if select is not None and 0 <= select < len(events):
+                tree.selection_set(str(select))
+
+        def selected_index():
+            selection = tree.selection()
+            return int(selection[0]) if selection else None
+
+        def delete_step():
+            i = selected_index()
+            if i is None:
+                return
+            events.pop(i)
+            gaps.pop(i)
+            if gaps:
+                gaps[0] = 0.0
+            rebuild_times()
+            redraw(min(i, len(events) - 1))
+
+        def set_delay():
+            i = selected_index()
+            if i is None:
+                return
+            value = ask_string("Set delay", "Delay before this step (seconds):",
+                               initial=str(round(gaps[i], 3)))
+            if value is None:
+                return
+            try:
+                delay = float(value)
+            except (TypeError, ValueError):
+                messagebox.showerror("Invalid delay", "Enter a number of seconds, 0 or greater.")
+                return
+            if delay < 0:
+                messagebox.showerror("Invalid delay", "Enter a number of seconds, 0 or greater.")
+                return
+            gaps[i] = 0.0 if i == 0 else delay
+            rebuild_times()
+            redraw(i)
+
+        def move(delta):
+            i = selected_index()
+            if i is None:
+                return
+            target = i + delta
+            if not (0 <= target < len(events)):
+                return
+            events[i], events[target] = events[target], events[i]
+            rebuild_times()
+            redraw(target)
+
+        def save_steps():
+            cfg["macros"][name]["events"] = events
+            save_config(cfg)
+            refresh()
+            set_status(f"Updated steps for '{name}' ({len(events)} events)")
+            win.destroy()
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="Delete step", command=delete_step).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Set delay…", command=set_delay).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Move up", command=lambda: move(-1)).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="Move down", command=lambda: move(1)).pack(side="left")
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(row, text="Save", style="Accent.TButton", command=save_steps).pack(
+            side="right", padx=(0, 8))
+        win.bind("<Escape>", lambda e: win.destroy())
+        redraw()
+        win.grab_set()
+
     def test_macro():
         name = selected_macro()
         if not name:
@@ -1894,6 +2148,55 @@ def run_gui(cfg, engine):
             set_status(f"Unbound {KEY_LABELS[keynum]}"
                        f" (key still sends {chord_macropad_token(keynum)})")
 
+    def reprogram_device():
+        if not messagebox.askyesno(
+                "Reprogram device",
+                f"Write all {len(cfg['shortcuts'])} configured key(s) to the macropad's flash?"):
+            return
+        import macropad as m
+        done, failed = [], []
+        try:
+            with m.Macropad() as mp:
+                for keynum, token_text in list(cfg["shortcuts"].items()):
+                    try:
+                        strokes = [m.parse_keystroke(tok) for tok in str(token_text).split()]
+                        if not (1 <= len(strokes) <= 5):
+                            failed.append(keynum)
+                            continue
+                        mp.set_keyboard(int(keynum), strokes)
+                        done.append(keynum)
+                    except Exception:
+                        failed.append(keynum)
+        except Exception as e:
+            messagebox.showerror(
+                "Device error", f"Could not program the macropad:\n{e}\n\nIs it plugged in?")
+            return
+        for keynum in done:
+            linked = cfg["bindings"].get(keynum)
+            note = ("Macro Studio: " + linked) if linked else (
+                "Sends: " + str(cfg["shortcuts"][keynum]))
+            _replace_layout_line(
+                keynum, {"type": "key", "keys": str(cfg["shortcuts"][keynum]), "note": note})
+        refresh()
+        msg = f"Reprogrammed {len(done)} key(s)"
+        if failed:
+            msg += f", {len(failed)} failed ({', '.join(failed)})"
+        set_status(msg)
+
+    def set_led_mode(mode):
+        try:
+            import macropad as m
+            with m.Macropad() as mp:
+                mp.set_led(int(mode))
+        except Exception as e:
+            messagebox.showerror(
+                "Device error", f"Could not set the LED:\n{e}\n\nIs it plugged in?")
+            return
+        cfg.setdefault("ui", {})["led"] = int(mode)
+        save_config(cfg)
+        labels = {0: "off", 1: "steady white", 2: "colour cycle", 3: "frozen"}
+        set_status(f"LED backlight: {labels.get(int(mode), mode)}")
+
     def export_binds():
         if not cfg["macros"]:
             set_status("No macros to export yet"); return
@@ -1955,6 +2258,7 @@ def run_gui(cfg, engine):
     add_button(key_bar, "bind", "Map Macro", bind)
     add_button(key_bar, "assign_shortcut", "Bind to Key (combination)", assign_shortcut)
     add_button(key_bar, "unbind", "Unbind", unbind)
+    add_button(key_bar, "reprogram", "Reprogram device", reprogram_device)
 
     # macro actions live on a right-click menu instead of a button bar. tk.Menu is the dated
     # Win95-style control, so this is a hand-built popup: a rounded, padded, dark Toplevel with
@@ -2028,13 +2332,111 @@ def run_gui(cfg, engine):
         win.focus_force()
         win.grab_set()
 
+    def switch_profile(target):
+        if target == cfg.get("active_profile"):
+            return
+        if target not in cfg["profiles"]:
+            return
+        cur = cfg.get("active_profile", "Default")
+        cfg["profiles"][cur] = {
+            "bindings": dict(cfg.get("bindings", {})),
+            "shortcuts": dict(cfg.get("shortcuts", {}))}
+        prof = cfg["profiles"][target]
+        cfg["bindings"] = dict(prof.get("bindings", {}))
+        cfg["shortcuts"] = dict(prof.get("shortcuts", {}))
+        cfg["active_profile"] = target
+        save_config(cfg)
+        engine.register_all()
+        refresh()
+        if cfg["shortcuts"] and messagebox.askyesno(
+                "Switch profile",
+                f"Switched to '{target}'.\n\nReprogram the device to match this profile now?"):
+            reprogram_device()
+        else:
+            set_status(f"Active profile: {target}")
+
+    def new_profile():
+        name = ask_string("New profile", "Name for the new profile:")
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in cfg["profiles"]:
+            set_status("A profile with that name exists")
+            return
+        cfg["profiles"][name] = {"bindings": {}, "shortcuts": {}}
+        save_config(cfg)
+        switch_profile(name)
+
+    def rename_profile():
+        active = cfg.get("active_profile", "Default")
+        new = ask_string("Rename profile", "New profile name:", initial=active)
+        if not new:
+            return
+        new = new.strip()
+        if not new or new == active:
+            return
+        if new in cfg["profiles"]:
+            messagebox.showwarning("Rename profile", "A profile with that name exists.")
+            return
+        cfg["profiles"][new] = cfg["profiles"].pop(active)
+        cfg["active_profile"] = new
+        save_config(cfg)
+        refresh()
+        refresh_profile_btn()
+        set_status(f"Renamed profile '{active}' to '{new}'")
+
+    def delete_profile():
+        if len(cfg["profiles"]) <= 1:
+            set_status("Can't delete the only profile")
+            return
+        active = cfg.get("active_profile", "Default")
+        if not messagebox.askyesno("Delete profile", f"Delete profile '{active}'?"):
+            return
+        cfg["profiles"].pop(active, None)
+        name = next(iter(cfg["profiles"]))
+        prof = cfg["profiles"][name]
+        cfg["bindings"] = dict(prof.get("bindings", {}))
+        cfg["shortcuts"] = dict(prof.get("shortcuts", {}))
+        cfg["active_profile"] = name
+        save_config(cfg)
+        engine.register_all()
+        refresh()
+        set_status(f"Deleted profile; active: {name}")
+
+    def open_profile_menu():
+        items = [(pname, lambda n=pname: switch_profile(n))
+                 for pname in sorted(cfg["profiles"])]
+        items.extend([None, ("New profile…", new_profile),
+                      ("Rename profile…", rename_profile),
+                      ("Delete profile", delete_profile)])
+        show_popup_menu(items, profile_btn.winfo_rootx(),
+                        profile_btn.winfo_rooty() + profile_btn.winfo_height())
+
+    profile_btn.config(command=open_profile_menu)
+
+    def open_led_menu():
+        # tick the mode last set from here (cfg["ui"]["led"]); a 2-char prefix slot keeps the
+        # labels aligned whether or not a row is checked.
+        current = cfg.get("ui", {}).get("led")
+        items = [(("✓ " if mode == current else "  ") + label,
+                  lambda mmode=mode: set_led_mode(mmode))
+                 for label, mode in (("Off", 0), ("Steady white", 1),
+                                     ("Colour cycle", 2), ("Freeze", 3))]
+        show_popup_menu(items, led_btn.winfo_rootx(),
+                        led_btn.winfo_rooty() + led_btn.winfo_height())
+
+    led_btn.config(command=open_led_menu)
+
     def macro_context(event):
         row = macro_list.identify_row(event.y)   # select the row under the cursor first, so
         if not row:                              # the action targets what was right-clicked
             return
         macro_list.selection_set(row)
         update_states()
-        show_popup_menu([("Rename", rename_macro), ("Set app…", set_app), ("Test", test_macro),
+        show_popup_menu([("Rename", rename_macro), ("Set app…", set_app),
+                         ("Edit steps…", edit_steps), ("Test", test_macro),
                          None, ("Delete", delete_macro)], event.x_root, event.y_root)
 
     macro_list.bind("<Button-3>", macro_context)
@@ -2052,9 +2454,20 @@ def run_gui(cfg, engine):
     refresh()
 
     # Clamp the minimum window size to what the fully-built layout actually needs, so no edge
-    # drag can hide a button. reqwidth/reqheight reflect every packed child at this point; a
-    # small margin absorbs title-bar/scrollbar rounding.
+    # drag can hide a button. First pin each pane's minsize to the width its own content (table
+    # + button bar) requires, so the divider itself can't clip a button either; then size the
+    # window from reqwidth/reqheight, which now includes those pinned minimums. A small margin
+    # absorbs title-bar/scrollbar rounding.
     def set_min_size():
+        root.update_idletasks()
+        lw = max(240, left_pane.winfo_reqwidth())
+        rw = max(240, right_pane.winfo_reqwidth())
+        pane_min["l"], pane_min["r"] = lw, rw
+        try:
+            pw.paneconfigure(left_pane, minsize=lw)
+            pw.paneconfigure(right_pane, minsize=rw)
+        except Exception:
+            pass
         root.update_idletasks()
         root.minsize(root.winfo_reqwidth() + 8, root.winfo_reqheight() + 8)
     set_min_size()
@@ -2079,16 +2492,26 @@ def run_gui(cfg, engine):
             root.after(0, root.destroy)
 
         def open_config_folder(icon=None, item=None):
-            # macros.json lives beside the .exe (portable) - open its folder so the config
-            # is easy to copy onto another machine or a USB stick.
             try:
                 os.startfile(os.path.dirname(CONFIG_PATH))
             except Exception:
                 pass
 
+        def open_backups_folder(icon=None, item=None):
+            try:
+                os.makedirs(BACKUP_DIR, exist_ok=True)
+                os.startfile(BACKUP_DIR)
+            except Exception:
+                pass
+
+        def choose_backup(icon=None, item=None):
+            root.after(0, restore_backup)
+
         menu = pystray.Menu(
             pystray.MenuItem("Open Macro Studio", show, default=True),
             pystray.MenuItem("Open config folder", open_config_folder),
+            pystray.MenuItem("Open backups folder", open_backups_folder),
+            pystray.MenuItem("Restore from backup…", choose_backup),
             pystray.MenuItem("Exit", quit_all),
         )
         icon = pystray.Icon("MacroStudio", img, "Macro Studio v%s" % __version__, menu)
@@ -2131,6 +2554,7 @@ def main():
         print("Macro Studio", __version__)
         return
     _seed_data_files()
+    _migrate_state_dir()
     cfg = load_config()
     imported = auto_import_folder(cfg)   # pick up any bundle .json dropped in the app folder
     engine = Engine(cfg)
@@ -2143,6 +2567,8 @@ def main():
         print("bindings:", cfg["bindings"])
         print("registered hotkeys:", list(engine._registered))
         print("chords:", CHORDS)
+        print("active profile:", cfg.get("active_profile"))
+        print("profiles:", list(cfg.get("profiles", {})))
         engine.unregister_all()
         print("selftest OK")
         return
