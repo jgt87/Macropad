@@ -143,6 +143,38 @@ device. Use a real combo when you want the key to *do* that thing everywhere; us
 trigger when you want it to drive a macro (then link one with **Map Macro** — the two coexist).
 **Unbind** clears the key.
 
+## Profiles & app-bound auto-switching
+
+A **profile** is a named set of key→macro mappings. Your recorded macros are shared across all
+profiles; a profile just decides *which* macro each key runs — so one pad can do different things
+in different contexts. Switch profiles from the **Profile ▾** dropdown at the top-right, or let
+Macro Studio switch them **automatically based on the app you're using**.
+
+**Set it up (all from the Profile ▾ menu):**
+
+1. Make a profile per context — **New profile…**, then map keys in it with **Map Macro** as usual.
+2. Tie a profile to an app: focus the target app once (e.g. VS Code), come back to Macro Studio,
+   open **Profile ▾** and click **Assign current app → '‹profile›'**. The menu then shows the
+   profile with its app, e.g. `VS Code — code.exe`. (An app belongs to one profile; assigning it
+   elsewhere moves it.)
+3. Pick a fallback with **Set '‹profile›' as fallback** — used when the focused app isn't tied to
+   any profile. It defaults to `Default` and is marked `— fallback` in the menu.
+4. Turn on **Auto-switch by app** (a ✓ appears next to it).
+
+Now focusing a tied app activates its profile; focusing an app tied to nothing activates the
+fallback. Focusing Macro Studio itself (or the desktop) leaves the current profile alone.
+
+**Good to know:**
+
+- Switching is **instant and never touches the device** — every profile uses the same pad
+  triggers (`F13`–`F21`), so only the app-side macro mapping changes. Nothing is written to flash,
+  so there's no wear or lag when you tab between apps.
+- It **pauses while recording** or while a dialog is open, so it can't fire mid-capture.
+- The one exception: if a profile changed what a key physically *sends* via **Bind to key** (a real
+  combo lives in the pad's flash), that part can't change per-app on its own — click **Reprogram
+  device** after switching to push that profile's `Sends` values to the pad. Trigger-based profiles
+  (the **Map Macro** default) switch with no extra step.
+
 ## Moving binds to another PC
 
 The firmware can't hold Macro Studio's *macros* — it's **write-only** (nothing can read a bind
