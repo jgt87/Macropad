@@ -110,9 +110,9 @@ How it works — **two independent layers per key**, shown as the *Sends* and *R
 
 1. **Sends (device):** what the physical key is programmed to emit — a real combo like `Ctrl+C`,
    or a *trigger key* `F13`–`F24` (no keyboard has these, so nothing else ever sends them). Set
-   with **Bind to key**; written to the pad's flash, so it works on any PC.
+   with **Link Keyboard Input**; written to the pad's flash, so it works on any PC.
 2. **Runs macro (app):** the recorded macro the app plays when it *detects* that sent key. Set
-   with **Map Macro**. So: press the pad key → it sends e.g. `F13` → the running app catches
+   with **Link Macro**. So: press the pad key → it sends e.g. `F13` → the running app catches
    `F13` and replays the macro. This is what gets past the 5-keystroke limit and adds app-context.
 
 - **Run it, either way:**
@@ -120,7 +120,7 @@ How it works — **two independent layers per key**, shown as the *Sends* and *R
     and double-click it. It's a single portable file; its `macros.json` config lives next to it.
   - **From source:** `pip install hidapi keyboard mouse pystray Pillow`, then `pythonw macro_studio.py`
     (auto-starts via a Startup-folder shortcut).
-- **Workflow:** Record New → select the macro + a key → **Map Macro**. That auto-assigns the key
+- **Workflow:** Record New → select the macro + a key → **Link Macro**. That auto-assigns the key
   its default trigger (`F13`–`F21`) and programs the pad, then links the macro. Press the key to
   run it. Use **Test** to try without the pad. Closing the window hides it to the tray.
 - **App context is automatic.** While recording, click into the application you want the
@@ -139,14 +139,15 @@ How it works — **two independent layers per key**, shown as the *Sends* and *R
   without it, recording falls back to keystroke-only. Global hooks may need the app run as
   admin to catch every key.
 
-## Bind a key to a keyboard combination
+## Link a keyboard input to a macropad control
 
-Select a key and click **Bind to key**, then either press the combination (e.g. `Ctrl+Shift+S`,
-or a short sequence like `Ctrl+C Ctrl+V`) **or** pick a trigger key `F13`–`F24` from the list
+Select a macropad control and click **Link Keyboard Input**, then either press the keyboard
+combination (e.g. `Ctrl+Shift+S` or a short sequence like `Ctrl+C Ctrl+V`) **or** pick a trigger
+key `F13`–`F24` from the list
 (those have no physical key, so you can't press them). Macro Studio programs it **straight onto
 the pad's flash**, so the key sends it on **any** PC with no app running — it travels with the
 device. Use a real combo when you want the key to *do* that thing everywhere; use an `F13`+
-trigger when you want it to drive a macro (then link one with **Map Macro** — the two coexist).
+trigger when you want it to drive a macro (then link one with **Link Macro** — the two coexist).
 **Unbind** clears the key.
 
 ## Profiles & app-bound auto-switching
@@ -158,7 +159,7 @@ Macro Studio switch them **automatically based on the app you're using**.
 
 **Set it up (all from the Profile ▾ menu):**
 
-1. Make a profile per context — **New profile…**, then map keys in it with **Map Macro** as usual.
+1. Make a profile per context — **New profile…**, then link keys with **Link Macro** as usual.
 2. Tie a profile to an app: focus the target app once (e.g. VS Code), come back to Macro Studio,
    open **Profile ▾** and click **Assign current app → '‹profile›'**. The menu then shows the
    profile with its app, e.g. `VS Code — code.exe`. (An app belongs to one profile; assigning it
@@ -176,10 +177,10 @@ fallback. Focusing Macro Studio itself (or the desktop) leaves the current profi
   triggers (`F13`–`F21`), so only the app-side macro mapping changes. Nothing is written to flash,
   so there's no wear or lag when you tab between apps.
 - It **pauses while recording** or while a dialog is open, so it can't fire mid-capture.
-- The one exception: if a profile changed what a key physically *sends* via **Bind to key** (a real
-  combo lives in the pad's flash), that part can't change per-app on its own — click **Reprogram
-  device** after switching to push that profile's `Sends` values to the pad. Trigger-based profiles
-  (the **Map Macro** default) switch with no extra step.
+- The one exception: if a profile changed what a key physically *sends* via
+  **Link Keyboard Input** (a real combo lives in the pad's flash), that part can't change per-app
+  on its own — click **Reprogram device** after switching to push that profile's `Sends` values
+  to the pad. Trigger-based profiles (the **Link Macro** default) switch with no extra step.
 
 ## Moving binds to another PC
 
@@ -191,9 +192,9 @@ app focus. So macros travel with the *config*, two ways:
   on a USB stick (or copy it to the other PC) and your binds show up there. The tray menu's
   **Open config folder** opens exactly this folder.
 - **Export / Import.** **Export…** writes all macros + bindings to one `.json`; **Import…**
-  loads it on another install (then use **Map Macro** to arm the physical keys there).
+  loads it on another install (then use **Link Macro** to arm the physical keys there).
 
-(Simple combos set with **Bind to key** don't need any of this — they're written to the
+(Simple combos set with **Link Keyboard Input** don't need any of this — they're written to the
 device's own flash, so they already travel with the pad to any PC on their own.)
 
 ## Building the executable

@@ -19,6 +19,7 @@ sometimes need the app to run elevated to capture every key.
 """
 import ctypes
 import json
+import math
 import os
 import re
 import shutil
@@ -79,8 +80,8 @@ LAUNCH_POLL = 0.25      # how often to look for that window
 FOREGROUND_POLL = 0.2   # how often to sample the foreground window while recording
 MAX_EVENT_GAP = 2.0     # cap replayed idle time: thinking pauses shouldn't be re-lived
 
-# Each macropad key number -> its DEFAULT trigger key. Map Macro assigns this (and programs
-# the pad to send it) when a key has no "sends" yet; Bind to key can override what a key sends.
+# Each macropad key number -> its DEFAULT trigger key. Link Macro assigns this (and programs
+# the pad to send it) when a key has no "sends" yet; Link Keyboard Input can override it.
 #
 # F13..F21 (single keys, no modifiers) rather than the old Ctrl+Alt+Win+Fn chords: those
 # collided with reserved Windows shortcuts - Win+F1 opens Help, and Windows swallows the
@@ -942,6 +943,17 @@ def describe_event(ev):
     return f"mouse {ev.get('b', 'left')} {ev.get('e')}"
 
 
+def uniform_event_gaps(event_count, milliseconds):
+    """Return timing gaps with zero before the first event and one uniform later gap."""
+    delay_ms = float(milliseconds)
+    if not math.isfinite(delay_ms) or not 0 <= delay_ms <= MAX_EVENT_GAP * 1000:
+        raise ValueError("delay must be between 0 and %d milliseconds"
+                         % int(MAX_EVENT_GAP * 1000))
+    if event_count <= 0:
+        return []
+    return [0.0] + [delay_ms / 1000.0] * (event_count - 1)
+
+
 CLICK_MARGIN = 8   # px of slack around the target window when validating a click
 
 
@@ -1197,6 +1209,23 @@ def _round_borderless(win):
         _dwm_set(hwnd, 33, 2)                                       # CORNER_PREFERENCE = ROUND
     except Exception:
         pass
+
+
+def _popup_position(x, y, width, height, bounds, padding=4):
+    """Clamp a popup's top-left corner inside its owner window.
+
+    ``bounds`` are screen coordinates (left, top, right, bottom).  Keeping them as signed
+    coordinates is important: monitors arranged left of the primary display have negative x
+    positions.  If an owner is smaller than the popup, pin that axis to its leading edge; the
+    popup cannot fit, but its origin still remains reachable.
+    """
+    left, top, right, bottom = bounds
+
+    def clamp(value, low, high):
+        return low if high < low else max(low, min(value, high))
+
+    return (clamp(x, left + padding, right - padding - width),
+            clamp(y, top + padding, bottom - padding - height))
 
 
 def _pick_font(tkfont, candidates, size, weight="normal"):
@@ -1790,7 +1819,7 @@ def run_gui(cfg, engine):
         preview is exactly what it will send. Triggers are silenced during capture so a
         macropad key can't fire a playback into it."""
         win = tk.Toplevel(root)
-        win.title("Bind to key")
+        win.title("Link keyboard input")
         win.attributes("-topmost", True)
         win.geometry("420x250")
         win.configure(bg=p["bg"])
@@ -1889,7 +1918,7 @@ def run_gui(cfg, engine):
         return state["result"]
 
     def assign_shortcut():
-        """Bind to key (layer 1): program the selected key to *send* a chosen keystroke.
+        """Link Keyboard Input (layer 1): program the selected pad control to send a keystroke.
 
         Capture a real combo, or pick a trigger key (F13..F24 - no physical key sends them, so
         they're collision-proof macro triggers). Written to the pad's flash, so it sends this on
@@ -2000,7 +2029,6 @@ def run_gui(cfg, engine):
         win = tk.Toplevel(root)
         win.title(f"Edit steps — {name}")
         win.transient(root)
-        win.geometry("560x420")
         win.configure(bg=p["bg"])
         _use_dark_titlebar(win, not _system_uses_light_theme())
         frame = ttk.Frame(win, padding=20)
@@ -2058,6 +2086,27 @@ def run_gui(cfg, engine):
             rebuild_times()
             redraw(i)
 
+        def set_all_delays():
+            value = ask_string(
+                "Set all delays",
+                "Delay before every action after the first (milliseconds):\n"
+                "Example: 100 = 0.1 seconds",
+                initial="100")
+            if value is None:
+                return
+            try:
+                new_gaps = uniform_event_gaps(len(events), value)
+            except (TypeError, ValueError):
+                messagebox.showerror(
+                    "Invalid delay",
+                    "Enter a number from 0 to %d milliseconds."
+                    % int(MAX_EVENT_GAP * 1000),
+                    parent=win)
+                return
+            gaps[:] = new_gaps
+            rebuild_times()
+            redraw(selected_index())
+
         def move(delta):
             i = selected_index()
             if i is None:
@@ -2076,17 +2125,46 @@ def run_gui(cfg, engine):
             set_status(f"Updated steps for '{name}' ({len(events)} events)")
             win.destroy()
 
-        row = ttk.Frame(frame)
-        row.pack(fill="x", pady=(12, 0))
-        ttk.Button(row, text="Delete step", command=delete_step).pack(side="left", padx=(0, 8))
-        ttk.Button(row, text="Set delay…", command=set_delay).pack(side="left", padx=(0, 8))
-        ttk.Button(row, text="Move up", command=lambda: move(-1)).pack(side="left", padx=(0, 8))
-        ttk.Button(row, text="Move down", command=lambda: move(1)).pack(side="left")
-        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
-        ttk.Button(row, text="Save", style="Accent.TButton", command=save_steps).pack(
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(actions, text="Delete step", command=delete_step).pack(
+            side="left", padx=(0, 8))
+        ttk.Button(actions, text="Set delay…", command=set_delay).pack(
+            side="left", padx=(0, 8))
+        ttk.Button(actions, text="Set all delays…", command=set_all_delays).pack(
+            side="left", padx=(0, 8))
+        ttk.Button(actions, text="Move up", command=lambda: move(-1)).pack(
+            side="left", padx=(0, 8))
+        ttk.Button(actions, text="Move down", command=lambda: move(1)).pack(side="left")
+
+        footer = ttk.Frame(frame)
+        footer.pack(fill="x", pady=(12, 0))
+        ttk.Button(footer, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(footer, text="Save", style="Accent.TButton", command=save_steps).pack(
             side="right", padx=(0, 8))
         win.bind("<Escape>", lambda e: win.destroy())
         redraw()
+
+        # Size from the finished, DPI-scaled layout and keep a generous baseline. Editing
+        # actions and Save/Cancel use separate rows so neither group can crowd out the other.
+        # Centre the resulting window inside Macro Studio using signed screen coordinates, so
+        # an app on a monitor left of the primary display stays on that monitor.
+        win.update_idletasks()
+        width = max(760, win.winfo_reqwidth() + 24)
+        height = max(460, win.winfo_reqheight() + 24)
+        win.minsize(width, height)
+        root.update_idletasks()
+        left, top = root.winfo_rootx(), root.winfo_rooty()
+        bounds = (left, top, left + root.winfo_width(), top + root.winfo_height())
+        x = left + (root.winfo_width() - width) // 2
+        y = top + (root.winfo_height() - height) // 2
+        x, y = _popup_position(x, y, width, height, bounds)
+        win.geometry("%dx%d%+d%+d" % (width, height, x, y))
+
+        # The custom context menu is topmost while it hands this action off. Explicitly raise
+        # the editor after that hand-off so it cannot settle behind Macro Studio.
+        win.lift(root)
+        win.focus_force()
         win.grab_set()
 
     def test_macro():
@@ -2104,12 +2182,12 @@ def run_gui(cfg, engine):
         root.after(2000, lambda: engine._run(name))
 
     def bind():
-        """Map Macro (layer 2): link a recorded macro to a key.
+        """Link Macro (layer 2): link a recorded macro to a key.
 
         The app plays it when it detects whatever the key *sends* (layer 1). If the key has no
         'sends' yet, give it its default trigger (F13..F21) and program that onto the device so
-        the link works immediately; if it already sends something (set via Bind to key), we
-        just listen for that instead - the two layers coexist."""
+        the link works immediately; if it already sends something (set via Link Keyboard Input),
+        we just listen for that instead - the two layers coexist."""
         name = selected_macro(); keynum = selected_keynum()
         if not name or not keynum:
             set_status("Select a macro AND a key"); return
@@ -2124,7 +2202,7 @@ def run_gui(cfg, engine):
             except Exception as e:
                 save_config(cfg); engine.register_all(); refresh()
                 set_status(f"Linked '{name}' to {KEY_LABELS[keynum]}, but couldn't program the"
-                           f" pad ({e}) - plug it in and run Map Macro again")
+                           f" pad ({e}) - plug it in and run Link Macro again")
                 return
         save_config(cfg); engine.register_all(); refresh()
         set_status(f"{KEY_LABELS[keynum]} sends {trigger} -> runs '{name}' while the app is open")
@@ -2237,15 +2315,15 @@ def run_gui(cfg, engine):
         if clash and not messagebox.askyesno(
                 "Import binds",
                 f"Import {len(macros)} macro(s)?\n\n{len(clash)} will overwrite macros of the "
-                "same name here.\n\nThe device is not reprogrammed - run 'Map Macro' (chord "
-                "binds) or 'Bind to key' (native combos) afterwards to arm the keys here."):
+                "same name here.\n\nThe device is not reprogrammed - run 'Link Macro' (chord "
+                "binds) or 'Link Keyboard Input' afterwards to arm the controls here."):
             return
         cfg["macros"].update(macros)
         cfg["bindings"].update(bindings)
         cfg["shortcuts"].update(shortcuts)   # the two layers coexist per key
         save_config(cfg); engine.register_all(); refresh()
         set_status(f"Imported {len(macros)} macro(s), {len(shortcuts)} shortcut(s) - "
-                   "arm the device with 'Map Macro' / 'Bind to key'")
+                   "arm the device with 'Link Macro' / 'Link Keyboard Input'")
 
     def add_button(parent, name, txt, fn, accent=False):
         b = ttk.Button(parent, text=txt, command=fn,
@@ -2264,8 +2342,8 @@ def run_gui(cfg, engine):
     btns["import"].pack(side="left")
 
     # macro-pane actions, then key-pane actions - each under the list it operates on
-    add_button(key_bar, "bind", "Map Macro", bind)
-    add_button(key_bar, "assign_shortcut", "Bind to Key (combination)", assign_shortcut)
+    add_button(key_bar, "bind", "Link Macro", bind)
+    add_button(key_bar, "assign_shortcut", "Link Keyboard Input…", assign_shortcut)
     add_button(key_bar, "unbind", "Unbind", unbind)
     add_button(key_bar, "reprogram", "Reprogram device", reprogram_device)
 
@@ -2321,9 +2399,11 @@ def run_gui(cfg, engine):
 
         win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
-        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        win.geometry("%dx%d+%d+%d" % (w, h, max(0, min(x, sw - w - 4)),
-                                      max(0, min(y, sh - h - 4))))
+        root.update_idletasks()
+        left, top = root.winfo_rootx(), root.winfo_rooty()
+        bounds = (left, top, left + root.winfo_width(), top + root.winfo_height())
+        px, py = _popup_position(x, y, w, h, bounds)
+        win.geometry("%dx%d%+d%+d" % (w, h, px, py))
         _round_borderless(win)
 
         def on_outside(e):

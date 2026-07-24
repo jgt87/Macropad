@@ -115,6 +115,31 @@ def test_describe_event():
     assert ms.describe_event({"src": "m", "e": "up", "b": "right"})
 
 
+def test_uniform_event_gaps():
+    assert ms.uniform_event_gaps(0, 100) == []
+    assert ms.uniform_event_gaps(1, 100) == [0.0]
+    assert ms.uniform_event_gaps(4, 100) == [0.0, 0.1, 0.1, 0.1]
+
+    for invalid in (-1, 2001, "not a number"):
+        try:
+            ms.uniform_event_gaps(2, invalid)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"{invalid!r} should be rejected")
+
+
+def test_popup_position_stays_inside_app_on_any_monitor():
+    bounds = (100, 50, 900, 650)
+    assert ms._popup_position(850, 600, 200, 160, bounds) == (696, 486)
+    assert ms._popup_position(20, 10, 200, 160, bounds) == (104, 54)
+
+    # A monitor to the left of the primary display uses negative screen coordinates. The
+    # popup must remain beside its app instead of being forced onto the primary monitor.
+    left_monitor_app = (-1800, 80, -1000, 680)
+    assert ms._popup_position(-1050, 620, 200, 160, left_monitor_app) == (-1204, 516)
+
+
 def test_save_config_preserves_profile_apps(tmp_path):
     old_config = ms.CONFIG_PATH
     try:
