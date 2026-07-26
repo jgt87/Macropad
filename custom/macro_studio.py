@@ -92,6 +92,7 @@ CHORDS = {
     "1":  "f13", "2":  "f14", "3":  "f15", "4":  "f16", "5":  "f17", "6":  "f18",
     "13": "f19", "14": "f20", "15": "f21",
 }
+DEDICATED_TRIGGERS = {"f%d" % n for n in range(13, 25)}
 KEY_LABELS = {
     "1": "Key 1", "2": "Key 2", "3": "Key 3", "4": "Key 4", "5": "Key 5",
     "6": "Key 6", "13": "Knob turn left", "14": "Knob press", "15": "Knob turn right",
@@ -1052,20 +1053,30 @@ class Engine:
                 self._register(keynum, trigger, macro_name)
 
     def _register(self, keynum, trigger, macro_name):
-        # `trigger` is exactly what the key sends ("f13", "ctrl+alt+x", ...). A native multi-key
-        # sequence ("ctrl+c ctrl+v") isn't a hotkey the OS can fire on, so add_hotkey rejects it
-        # and that key just performs its keystrokes without triggering a macro.
+        # Dedicated F13..F24 triggers use a direct key-down hook. The hotkey state machine waits
+        # for key-up before it can fire again; if USB wake/resume drops that release, the trigger
+        # stays logically held and every later pad press is ignored. A direct hook treats every
+        # new down event independently. Real combinations still need add_hotkey's chord parser.
         try:
-            handle = keyboard.add_hotkey(trigger, self._run, args=(macro_name,),
-                                         suppress=False, trigger_on_release=False)
+            normal = str(trigger).strip().lower()
+            if normal in DEDICATED_TRIGGERS:
+                handle = keyboard.on_press_key(
+                    normal, lambda _event, name=macro_name: self._run(name), suppress=False)
+                remove = keyboard.unhook
+            else:
+                # A native multi-key sequence ("ctrl+c ctrl+v") isn't one hotkey the OS can
+                # fire, so add_hotkey rejects it and the key simply performs its keystrokes.
+                handle = keyboard.add_hotkey(trigger, self._run, args=(macro_name,),
+                                             suppress=False, trigger_on_release=False)
+                remove = keyboard.remove_hotkey
         except Exception:
             return
-        self._registered[keynum] = handle
+        self._registered[keynum] = (remove, handle)
 
     def unregister_all(self):
-        for h in self._registered.values():
+        for remove, handle in self._registered.values():
             try:
-                keyboard.remove_hotkey(h)
+                remove(handle)
             except Exception:
                 pass
         self._registered.clear()

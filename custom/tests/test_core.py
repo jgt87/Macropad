@@ -129,6 +129,42 @@ def test_uniform_event_gaps():
             raise AssertionError(f"{invalid!r} should be rejected")
 
 
+def test_engine_uses_direct_hooks_for_dedicated_triggers(monkeypatch):
+    cfg = {
+        "macros": {"Direct": {"events": []}, "Combo": {"events": []}},
+        "bindings": {"5": "Direct", "1": "Combo"},
+        "shortcuts": {"5": "f17", "1": "ctrl+s"},
+    }
+    calls, removed, fired = [], [], []
+
+    def on_press_key(trigger, callback, suppress=False):
+        calls.append(("direct", trigger, suppress, callback))
+        return "direct-handle"
+
+    def add_hotkey(trigger, callback, args=(), **kwargs):
+        calls.append(("hotkey", trigger, args, kwargs))
+        return "hotkey-handle"
+
+    monkeypatch.setattr(ms.keyboard, "on_press_key", on_press_key)
+    monkeypatch.setattr(ms.keyboard, "add_hotkey", add_hotkey)
+    monkeypatch.setattr(ms.keyboard, "unhook", lambda handle: removed.append(("direct", handle)))
+    monkeypatch.setattr(ms.keyboard, "remove_hotkey",
+                        lambda handle: removed.append(("hotkey", handle)))
+
+    engine = ms.Engine(cfg)
+    engine._run = lambda name: fired.append(name)
+    engine.register_all()
+
+    direct = next(call for call in calls if call[0] == "direct")
+    assert direct[1:3] == ("f17", False)
+    direct[3](None)
+    assert fired == ["Direct"]
+    assert any(call[0:3] == ("hotkey", "ctrl+s", ("Combo",)) for call in calls)
+
+    engine.unregister_all()
+    assert sorted(removed) == [("direct", "direct-handle"), ("hotkey", "hotkey-handle")]
+
+
 def test_popup_position_stays_inside_app_on_any_monitor():
     bounds = (100, 50, 900, 650)
     assert ms._popup_position(850, 600, 200, 160, bounds) == (696, 486)
