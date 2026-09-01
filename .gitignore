@@ -29,3 +29,6 @@ custom/dist/
 
 # Local screenshot / scratch dropbox next to the app
 custom/temp/
+
+# Repowise local codebase index
+.repowise/
