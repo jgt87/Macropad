@@ -39,3 +39,4 @@ custom/temp/
 
 # repowise owner-digest key (local)
 .repowise/events.key
+.github/copilot-instructions.md
